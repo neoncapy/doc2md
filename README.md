@@ -667,6 +667,12 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
+## Related Projects
+
+- **[claude-code-orchestration-protocol](https://github.com/orangefineblue/claude-code-orchestration-protocol)** — A zero-read orchestrator protocol for Claude Code that manages context window usage, delegates work to sub-agents, and runs QC loops until zero issues remain. Designed to work alongside doc2md for complex multi-document workflows where context rot is a concern.
+
+---
+
 ## Acknowledgements
 
 Built for use with [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
