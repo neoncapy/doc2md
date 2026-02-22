@@ -1,0 +1,28 @@
+# Core extraction
+PyMuPDF>=1.24.0          # fitz — PDF text/image extraction
+pymupdf4llm>=0.0.10      # Enhanced PDF-to-markdown with table support
+pdfplumber>=0.11.0        # Cross-validation PDF extractor
+
+# Office formats
+python-pptx>=0.6.21      # PPTX reading and image extraction
+python-docx>=0.8.11      # DOCX reading and image extraction
+openpyxl>=3.1.0           # XLSX reading (used by convert-paper.py)
+
+# Image processing
+Pillow>=10.0.0            # Image analysis, blank detection, format conversion
+numpy>=1.24.0             # Pixel-level image analysis (blank/near-black detection)
+
+# Markdown fallback
+markitdown>=0.1.0         # Fallback converter for DOCX/PPTX/XLSX
+
+# DOCX styling (style-docx-tables.py)
+# python-docx is listed above — also used by style-docx-tables.py
+
+# Optional: MinerU (complex/scanned PDFs)
+# magic-pdf>=1.3.0        # Uncomment if using MinerU fallback extractor
+
+# System dependencies (install separately):
+#   pandoc          — DOCX/PPTX text extraction fallback
+#   pdftoppm        — PDF page rendering (part of poppler-utils)
+#   soffice         — LibreOffice for chart/SmartArt rendering
+#   tesseract       — OCR for scanned PDFs (optional)
