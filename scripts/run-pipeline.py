@@ -9,6 +9,9 @@ Step 1b: Cross-validate extraction with pdfplumber (PDF only)
 Step 2: qc-structural.py (GATE: must PASS before proceeding)
 Step 3: prepare-image-analysis.py (if images exist)
 Step 6a: extract-numbers.py (if PDF format)
+Step 6c: Image Index Generation (R19)
+Step 3b: Re-run prepare-image-analysis.py (if Step 3 was skipped
+         because image-manifest.json did not yet exist at Step 3 time)
 Then reports which Claude subagent steps to run.
 
 Usage:
@@ -17,6 +20,7 @@ Usage:
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -56,6 +60,9 @@ SCRIPTS_DIR = Path(__file__).parent
 REGISTRY_PATH = Path.home() / ".claude/pipeline/conversion_registry.json"
 SCAN_THRESHOLD = 50  # avg chars/page below this = treat as scanned
 PIPELINE_VERSION = "3.2.0"
+# Marker wrapper script path (single definition; used by select_extractor,
+# _build_cmd_for_extractor, and the runtime fallback chain).
+_MARKER_WRAPPER = str(SCRIPTS_DIR / "convert-paper-marker.py")
 
 # ── v3.1 naming convention ────────────────────────────────────────────────
 # R9: The subfolder for organized source files is always exactly this name.
@@ -88,13 +95,49 @@ VECTOR_DRAWING_THRESHOLD_LOW = 7   # Lower bound for area-based check
 VECTOR_DRAWING_MIN_AREA_PCT = 5.0  # Min % of page area for a single drawing
 VECTOR_DRAWING_HIGH_MIN_AREA_PCT = 1.0  # Min % for >=50 drawings (filters decorative journal styling)
 
+# ── Pipeline issue reporting ───────────────────────────────────────────────
+REPORTS_DIR = os.path.join(os.path.expanduser("~"), ".doc2md", "pipeline-improvement", "reports")
+
+# Known failure patterns for auto-detection
+KNOWN_FAILURE_PATTERNS = {
+    "2000px_crash": {
+        "pattern": r"exceeds the dimension limit|2000px|dimension limit for many-image",
+        "severity": "CRITICAL",
+        "category": "crash",
+        "description": "Image exceeds Anthropic 2000px dimension limit for vision API",
+        "proposed_fix": "Add image resize step before Opus vision (PIL thumbnail to 2000px max)"
+    },
+    "blank_image": {
+        "pattern": r"blank.*image|image.*blank|empty.*image|zero.*byte",
+        "severity": "MAJOR",
+        "category": "quality",
+        "description": "Blank or empty image detected during extraction",
+        "proposed_fix": "Enhance blank detection in extraction step; add 3-tier detection (file size, pixel std, near-black)"
+    },
+    "missing_manifest": {
+        "pattern": r"manifest.*not found|no.*manifest|FileNotFoundError.*manifest",
+        "severity": "CRITICAL",
+        "category": "crash",
+        "description": "Analysis manifest file not found",
+        "proposed_fix": "Add manifest existence check before dependent steps; generate skeleton manifest on missing"
+    },
+    "extraction_failure": {
+        "pattern": r"extraction.*fail|failed.*extract|could not extract",
+        "severity": "CRITICAL",
+        "category": "crash",
+        "description": "Image or text extraction failed",
+        "proposed_fix": "Add fallback extractor; log specific failure with page number"
+    }
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TYPES
 # ═══════════════════════════════════════════════════════════════════════════
 
 ExtractorType = Literal[
-    "pymupdf4llm", "tesseract", "mineru", "zerox", "markitdown", "calibre"
+    "pymupdf4llm", "tesseract", "mineru", "zerox", "markitdown", "calibre",
+    "docling", "marker"
 ]
 
 
@@ -118,6 +161,31 @@ def _warn(msg: str) -> None:
     print(f"WARN [router]: {msg}", file=sys.stderr)
 
 
+def _ensure_max_dimension(img_path, max_dim=2000):
+    """Resize image in-place if either dimension exceeds max_dim.
+
+    Uses PIL thumbnail() which preserves aspect ratio and uses LANCZOS
+    resampling for quality.  Images already within limits are untouched.
+
+    Returns True if image was resized, False otherwise.
+    """
+    try:
+        from PIL import Image as _PilResize
+        with _PilResize.open(img_path) as _img:
+            if max(_img.size) <= max_dim:
+                return False
+            _orig = _img.size
+            _img.thumbnail((max_dim, max_dim), _PilResize.LANCZOS)
+            _img.save(img_path)
+            print(f"    [resize] {Path(img_path).name}: "
+                  f"{_orig[0]}x{_orig[1]} -> "
+                  f"{_img.size[0]}x{_img.size[1]}")
+            return True
+    except Exception as _e:
+        _warn(f"Could not resize {Path(img_path).name}: {_e}")
+        return False
+
+
 def _fail(msg: str, checkpoint: Optional[dict] = None,
           checkpoint_path: Optional[Path] = None) -> None:
     """Log failure, write checkpoint if available, exit 2."""
@@ -132,6 +200,147 @@ def _fail(msg: str, checkpoint: Optional[dict] = None,
             print(f"WARN [router]: could not write checkpoint: {e}",
                   file=sys.stderr)
     sys.exit(2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PIPELINE ISSUE REPORTING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def write_pipeline_report(severity, category, description, root_cause="Unknown",
+                          impact="Not assessed", proposed_fix="None",
+                          affected_files=None, session="auto-detected",
+                          auto_detected=False):
+    """Write a structured issue report to the pipeline improvement reports folder."""
+    import glob as _glob
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    # Create a short slug from description
+    slug = description[:50].lower()
+    slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
+
+    # Find unique filename
+    base_name = f"{date_str}-{slug}"
+    file_path = os.path.join(REPORTS_DIR, f"{base_name}.md")
+    counter = 1
+    while os.path.exists(file_path):
+        file_path = os.path.join(REPORTS_DIR, f"{base_name}-{counter}.md")
+        counter += 1
+
+    report_content = f"""# {description}
+
+## Issues
+
+### Issue 1: {description}
+
+- **Session**: {session}
+- **Severity**: {severity}
+- **Category**: {category}
+- **Description**: {description}
+- **Root cause**: {root_cause}
+- **Impact**: {impact}
+- **Proposed fix**: {proposed_fix}
+- **Affected files**: {', '.join(affected_files) if affected_files else 'Not specified'}
+"""
+
+    with open(file_path, 'w') as f:
+        f.write(report_content)
+
+    print(f"[REPORT] Pipeline issue logged to: {file_path}")
+    return file_path
+
+
+def check_for_known_failures(error_message, context=""):
+    """Check an error message against known failure patterns and auto-report."""
+    for failure_id, failure_info in KNOWN_FAILURE_PATTERNS.items():
+        if re.search(failure_info["pattern"], error_message, re.IGNORECASE):
+            write_pipeline_report(
+                severity=failure_info["severity"],
+                category=failure_info["category"],
+                description=failure_info["description"],
+                root_cause=f"Auto-detected pattern: {failure_id}. Error: {error_message[:200]}",
+                impact="Pipeline execution interrupted",
+                proposed_fix=failure_info["proposed_fix"],
+                affected_files=["scripts/run-pipeline.py"],
+                auto_detected=True
+            )
+            return True
+    return False
+
+
+def run_health_check():
+    """Read all pipeline reports and display unresolved issues."""
+    import glob as _glob
+
+    report_files = sorted(_glob.glob(os.path.join(REPORTS_DIR, "*.md")))
+    report_files = [f for f in report_files if not f.endswith("README.md")
+                    and not f.endswith("CROSS-PROJECT-PROMPTS.md")]
+
+    if not report_files:
+        print("[HEALTH] No pipeline issue reports found.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"PIPELINE HEALTH CHECK — {len(report_files)} report(s) found")
+    print(f"{'='*60}\n")
+
+    severity_counts = {"CRITICAL": 0, "MAJOR": 0, "MINOR": 0}
+
+    for report_path in report_files:
+        filename = os.path.basename(report_path)
+        with open(report_path, 'r') as f:
+            content = f.read()
+
+        # Check if resolved
+        is_resolved = "RESOLVED:" in content
+
+        # Count severities
+        for sev in severity_counts:
+            severity_counts[sev] += content.count(f"**Severity**: {sev}")
+
+        status = "RESOLVED" if is_resolved else "OPEN"
+        print(f"  [{status}] {filename}")
+
+    print(f"\n{'─'*40}")
+    print(f"  CRITICAL: {severity_counts['CRITICAL']}")
+    print(f"  MAJOR:    {severity_counts['MAJOR']}")
+    print(f"  MINOR:    {severity_counts['MINOR']}")
+    print(f"{'─'*40}")
+
+    def _file_is_unresolved(path):
+        with open(path, 'r') as fh:
+            return "RESOLVED:" not in fh.read()
+
+    open_count = sum(1 for f in report_files if _file_is_unresolved(f))
+    if open_count > 0:
+        print(f"\n  ⚠ {open_count} OPEN issue(s) need attention")
+    else:
+        print(f"\n  ✓ All issues resolved")
+    print()
+
+
+def interactive_report_issue():
+    """Interactively create a pipeline issue report."""
+    print("\n--- Pipeline Issue Report ---\n")
+    print(f"Report will be saved to: {REPORTS_DIR}\n")
+
+    session = input("Session (project + session ID): ").strip() or "manual"
+    severity = input("Severity (CRITICAL/MAJOR/MINOR): ").strip().upper() or "MINOR"
+    category = input("Category (crash/performance/quality/workflow/missing-feature/documentation): ").strip() or "quality"
+    description = input("Description: ").strip() or "Unspecified issue"
+    root_cause = input("Root cause (or press Enter to skip): ").strip() or "Unknown"
+    impact = input("Impact (or press Enter to skip): ").strip() or "Not assessed"
+    proposed_fix = input("Proposed fix (or press Enter to skip): ").strip() or "None"
+    affected = input("Affected files (comma-separated, or press Enter to skip): ").strip()
+    affected_files = [f.strip() for f in affected.split(",")] if affected else None
+
+    path = write_pipeline_report(
+        severity=severity, category=category, description=description,
+        root_cause=root_cause, impact=impact, proposed_fix=proposed_fix,
+        affected_files=affected_files, session=session
+    )
+    print(f"\nReport saved to: {path}\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -262,6 +471,29 @@ def _zerox_available() -> bool:
     return (SCRIPTS_DIR / "convert-zerox.py").exists()
 
 
+def _docling_available() -> bool:
+    """Check if docling is importable in the current Python environment."""
+    try:
+        from docling.document_converter import DocumentConverter  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _pymupdf4llm_available() -> bool:
+    """Check if pymupdf4llm extractor is available.
+
+    Wraps the module-level _HAS_PYMUPDF4LLM flag for consistency with
+    _docling_available(), _mineru_available(), _tesseract_available().
+    """
+    return _HAS_PYMUPDF4LLM
+
+
+def _marker_available() -> bool:
+    """Check if marker-pdf CLI (marker_single) is available."""
+    return shutil.which("marker_single") is not None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # EXTRACTOR SELECTION ROUTER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -274,7 +506,7 @@ def select_extractor(pdf_path: Path,
 
     Chains:
       Digital (>= 50 chars/page):
-        pymupdf4llm -> (table fallbacks handled by qc-structural.py)
+        marker -> docling -> pymupdf4llm -> mineru -> tesseract
         NOTE: Digital table fallbacks (Camelot -> pdfplumber -> MinerU)
         are triggered by qc-structural.py downstream, not by this router.
       Scanned (< 50 chars/page):
@@ -314,6 +546,8 @@ def select_extractor(pdf_path: Path,
 
     # ── Force override ──
     if force_extractor:
+        _warn(f"Forcing extractor '{force_extractor}' "
+              "-- skipping availability check and auto-detection")
         if force_extractor == "tesseract":
             return ExtractorConfig(
                 extractor="tesseract",
@@ -341,6 +575,24 @@ def select_extractor(pdf_path: Path,
                 avg_chars_per_page=avg,
                 page_count=page_count,
             )
+        elif force_extractor == "docling":
+            return ExtractorConfig(
+                extractor="docling",
+                script=convert_paper,
+                extra_args=["--extractor", "docling"],
+                is_scanned=is_scanned,
+                avg_chars_per_page=avg,
+                page_count=page_count,
+            )
+        elif force_extractor == "marker":
+            return ExtractorConfig(
+                extractor="marker",
+                script=_MARKER_WRAPPER,
+                extra_args=[],
+                is_scanned=is_scanned,
+                avg_chars_per_page=avg,
+                page_count=page_count,
+            )
         else:
             _warn(f"Unknown forced extractor '{force_extractor}'. "
                   "Falling through to auto-detection.")
@@ -352,8 +604,31 @@ def select_extractor(pdf_path: Path,
 
     if not is_scanned:
         # ── Digital chain ──
-        # pymupdf4llm is the default. Table fallbacks (Camelot, pdfplumber)
-        # are handled downstream by qc-structural.py, not the router.
+        # marker is the new default for digital PDFs (S42). Falls back
+        # to docling then pymupdf4llm via _DIGITAL_CHAIN.
+        if _marker_available():
+            return ExtractorConfig(
+                extractor="marker",
+                script=_MARKER_WRAPPER,
+                extra_args=[],
+                is_scanned=False,
+                avg_chars_per_page=avg,
+                page_count=page_count,
+            )
+        # marker unavailable -> try docling
+        if _docling_available():
+            _warn("Marker not available. Falling back to docling.")
+            return ExtractorConfig(
+                extractor="docling",
+                script=convert_paper,
+                extra_args=["--extractor", "docling"],
+                is_scanned=False,
+                avg_chars_per_page=avg,
+                page_count=page_count,
+            )
+        # Docling also unavailable -> fall back to pymupdf4llm
+        _warn("Marker and docling not available. "
+              "Falling back to pymupdf4llm.")
         return ExtractorConfig(
             extractor="pymupdf4llm",
             script=convert_paper,
@@ -731,60 +1006,71 @@ def update_registry(pdf_path: Path, output_md: Path,
     """
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    registry = {"conversions": []}
-    if REGISTRY_PATH.exists():
+    # Lock the entire read-modify-write cycle to prevent concurrent
+    # lost updates (MINOR-2 fix).
+    # NOTE: The .json.lock file is intentionally persistent (never deleted).
+    # fcntl.flock() works on existing files, and keeping the file avoids a
+    # race condition where two processes try to create it simultaneously.
+    _lock_path = REGISTRY_PATH.with_suffix(".json.lock")
+    with open(_lock_path, "w") as _lf:
+        fcntl.flock(_lf, fcntl.LOCK_EX)
         try:
-            with open(REGISTRY_PATH) as f:
-                registry = json.load(f)
-            if not isinstance(registry, dict) or "conversions" not in registry:
-                raise ValueError("malformed registry")
-        except (json.JSONDecodeError, ValueError) as e:
-            backup = REGISTRY_PATH.with_suffix(".json.bak")
-            _warn(f"Registry corrupt ({e}). Backing up to {backup} "
-                  "and starting fresh.")
-            try:
-                shutil.copy2(REGISTRY_PATH, backup)
-            except Exception:
-                pass
             registry = {"conversions": []}
+            if REGISTRY_PATH.exists():
+                try:
+                    with open(REGISTRY_PATH) as f:
+                        registry = json.load(f)
+                    if not isinstance(registry, dict) or "conversions" not in registry:
+                        raise ValueError("malformed registry")
+                except (json.JSONDecodeError, ValueError) as e:
+                    backup = REGISTRY_PATH.with_suffix(".json.bak")
+                    _warn(f"Registry corrupt ({e}). Backing up to {backup} "
+                          "and starting fresh.")
+                    try:
+                        shutil.copy2(REGISTRY_PATH, backup)
+                    except Exception:
+                        pass
+                    registry = {"conversions": []}
 
-    # Remove existing entry with same hash (dedup)
-    existing = [c for c in registry.get("conversions", [])
-                if c.get("source_hash") != source_hash]
-    new_entry = {
-        "source_hash": source_hash,
-        "source_path": str(pdf_path.resolve()),
-        "output_path": str(output_md.resolve()),
-        "extractor_used": extractor,
-        "converted_at": datetime.now().isoformat(),
-        "pipeline_version": PIPELINE_VERSION,
-    }
+            # Remove existing entry with same hash (dedup)
+            existing = [c for c in registry.get("conversions", [])
+                        if c.get("source_hash") != source_hash]
+            new_entry = {
+                "source_hash": source_hash,
+                "source_path": str(pdf_path.resolve()),
+                "output_path": str(output_md.resolve()),
+                "extractor_used": extractor,
+                "converted_at": datetime.now().isoformat(),
+                "pipeline_version": PIPELINE_VERSION,
+            }
 
-    # R21: Add image index metadata if available
-    if image_index_meta is not None:
-        new_entry["image_index_path"] = image_index_meta.get(
-            "image_index_path", "")
-        new_entry["image_index_generated_at"] = image_index_meta.get(
-            "image_index_generated_at", "")
-        new_entry["total_pages"] = image_index_meta.get(
-            "total_pages", 0)
-        new_entry["pages_with_images"] = image_index_meta.get(
-            "pages_with_images", 0)
-        new_entry["total_images_detected"] = image_index_meta.get(
-            "total_images_detected", 0)
-        new_entry["substantive_images"] = image_index_meta.get(
-            "substantive_images", 0)
-        new_entry["has_testable_images"] = image_index_meta.get(
-            "has_testable_images", False)
+            # R21: Add image index metadata if available
+            if image_index_meta is not None:
+                new_entry["image_index_path"] = image_index_meta.get(
+                    "image_index_path", "")
+                new_entry["image_index_generated_at"] = image_index_meta.get(
+                    "image_index_generated_at", "")
+                new_entry["total_pages"] = image_index_meta.get(
+                    "total_pages", 0)
+                new_entry["pages_with_images"] = image_index_meta.get(
+                    "pages_with_images", 0)
+                new_entry["total_images_detected"] = image_index_meta.get(
+                    "total_images_detected", 0)
+                new_entry["substantive_images"] = image_index_meta.get(
+                    "substantive_images", 0)
+                new_entry["has_testable_images"] = image_index_meta.get(
+                    "has_testable_images", False)
 
-    existing.append(new_entry)
-    registry["conversions"] = existing
+            existing.append(new_entry)
+            registry["conversions"] = existing
 
-    # Atomic write: write to temp file then replace (POSIX atomic on same FS)
-    tmp_path = REGISTRY_PATH.with_suffix(".json.tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(registry, f, indent=2)
-    tmp_path.replace(REGISTRY_PATH)
+            # Atomic write: temp file then replace
+            tmp_path = REGISTRY_PATH.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(registry, f, indent=2)
+            tmp_path.replace(REGISTRY_PATH)
+        finally:
+            fcntl.flock(_lf, fcntl.LOCK_UN)
 
     print(f"\nRegistry updated: {REGISTRY_PATH}")
     print(f"  source_hash: {source_hash}")
@@ -801,14 +1087,30 @@ def update_registry(pdf_path: Path, output_md: Path,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_command(cmd: list, description: str,
-                allow_failure: bool = False) -> int:
-    """Run a command and report status. Returns exit code."""
+                allow_failure: bool = False,
+                timeout: Optional[int] = None) -> int:
+    """Run a command and report status. Returns exit code.
+
+    Args:
+        cmd: Command list for subprocess.run.
+        description: Human-readable description for logging.
+        allow_failure: If True, do not log ERROR on nonzero exit.
+        timeout: Optional timeout in seconds. Returns exit code 124
+                 (consistent with GNU timeout) if exceeded.
+    """
     print(f"\n{'=' * 60}")
     print(f"Running: {description}")
     print(f"Command: {shlex.join(str(c) for c in cmd)}")
+    if timeout is not None:
+        print(f"Timeout: {timeout}s")
     print('=' * 60)
 
-    result = subprocess.run(cmd, capture_output=False)
+    try:
+        result = subprocess.run(cmd, capture_output=False,
+                                timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"\nERROR: {description} timed out after {timeout}s")
+        return 124  # GNU timeout convention
 
     if result.returncode != 0 and not allow_failure:
         print(f"\nERROR: {description} failed with exit code "
@@ -816,6 +1118,74 @@ def run_command(cmd: list, description: str,
         return result.returncode
 
     return result.returncode
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXTRACTOR QUALITY GATE (shared helper)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _extractor_quality_gate(extractor_name: str, output_md: Path,
+                            input_pdf: Path) -> bool:
+    """Lightweight word-count quality gate: compare extractor output vs fitz.
+
+    Used by docling and marker quality gates after extraction to flag
+    potentially incomplete conversions.  Logs a WARNING if the extractor
+    produced <30% of the fitz word count, INFO if <60%, and INFO-OK
+    otherwise.
+
+    Returns True if extraction is critically empty (<10% of expected
+    text), signaling the caller to treat this as a failed extraction
+    and trigger the fallback chain.  Returns False otherwise.
+
+    Args:
+        extractor_name: Human-readable extractor name (e.g. "Docling", "Marker").
+        output_md: Path to the extractor's markdown output.
+        input_pdf: Path to the source PDF (read by fitz for reference text).
+    """
+    try:
+        import fitz as _fitz_qg
+        _doc_qg = _fitz_qg.open(str(input_pdf))
+        _fitz_text = ""
+        for _page in _doc_qg:
+            _fitz_text += _page.get_text("text")
+        _doc_qg.close()
+
+        _fitz_words = len(_fitz_text.split())
+        _ext_text = output_md.read_text(encoding="utf-8")
+        _ext_words = len(_ext_text.split())
+
+        if _fitz_words > 0:
+            _ratio = _ext_words / _fitz_words
+            # Determine next-in-chain fallback for the warning message
+            _fallback_hint = {
+                "Docling": "pymupdf4llm",
+                "Marker": "docling",
+            }.get(extractor_name, "next extractor")
+            if _ratio < 0.1:
+                _warn(
+                    f"{extractor_name} output is critically empty: "
+                    f"{_ratio:.0%} of expected text ({_ext_words} vs "
+                    f"{_fitz_words} fitz words). Forcing fallback "
+                    f"to {_fallback_hint}.")
+                return True  # Critical: trigger fallback
+            elif _ratio < 0.3:
+                _warn(
+                    f"{extractor_name} output has only {_ratio:.0%} of "
+                    f"expected text ({_ext_words} vs "
+                    f"{_fitz_words} fitz words). Consider "
+                    f"fallback to {_fallback_hint}.")
+            elif _ratio < 0.6:
+                print(
+                    f"  [INFO] {extractor_name} word ratio: {_ratio:.0%} "
+                    f"({_ext_words}/{_fitz_words} fitz words)")
+            else:
+                print(
+                    f"  [INFO] {extractor_name} word ratio: {_ratio:.0%} "
+                    f"({_ext_words}/{_fitz_words} fitz words)"
+                    f" - OK")
+    except Exception as _e_qg:
+        print(f"  [WARNING] {extractor_name} quality check failed: {_e_qg}")
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -828,9 +1198,9 @@ def run_command(cmd: list, description: str,
 _SCANNED_CHAIN = ["tesseract", "mineru", "zerox"]
 
 # Ordered fallback chain for digital PDFs.
-# pymupdf4llm is the default; if it crashes (e.g. ValueError in table
-# detection), the router tries mineru then tesseract before giving up.
-_DIGITAL_CHAIN = ["pymupdf4llm", "mineru", "tesseract"]
+# marker is the default (S42); if it crashes, the router tries docling
+# then pymupdf4llm then mineru then tesseract before giving up.
+_DIGITAL_CHAIN = ["marker", "docling", "pymupdf4llm", "mineru", "tesseract"]
 
 
 def _build_cmd_for_extractor(extractor: str, input_file: Path,
@@ -842,7 +1212,7 @@ def _build_cmd_for_extractor(extractor: str, input_file: Path,
     Centralizes command construction so both the initial run and
     fallback retries use the same logic.
     """
-    if extractor in ("pymupdf4llm", "tesseract"):
+    if extractor in ("pymupdf4llm", "tesseract", "docling"):
         cmd = [
             sys.executable,
             str(SCRIPTS_DIR / "convert-paper.py"),
@@ -851,6 +1221,13 @@ def _build_cmd_for_extractor(extractor: str, input_file: Path,
             "-i", str(images_dir),
             "-s", short_name,
             "--extractor", extractor,
+        ]
+    elif extractor == "marker":
+        cmd = [
+            sys.executable,
+            _MARKER_WRAPPER,
+            str(input_file),
+            "--output-dir", str(output_md.parent),
         ]
     elif extractor == "mineru":
         cmd = [
@@ -876,7 +1253,7 @@ def _build_cmd_for_extractor(extractor: str, input_file: Path,
             "-i", str(images_dir),
             "-s", short_name,
         ]
-    if no_images and extractor in ("pymupdf4llm", "tesseract"):
+    if no_images and extractor in ("pymupdf4llm", "tesseract", "docling"):
         cmd.append("--no-images")
     return cmd
 
@@ -905,10 +1282,10 @@ def _next_scanned_fallback(current_extractor: str) -> Optional[str]:
 def _next_digital_fallback(current_extractor: str) -> Optional[str]:
     """Return the next extractor in the digital fallback chain.
 
-    Used when pymupdf4llm crashes on a digital PDF (e.g. ValueError
+    Used when an extractor crashes on a digital PDF (e.g. ValueError
     in table detection code inside pymupdf/table.py).
 
-    Fallback order: pymupdf4llm -> mineru -> tesseract
+    Fallback order: marker -> docling -> pymupdf4llm -> mineru -> tesseract
     Returns None if there is no available next extractor.
     """
     try:
@@ -916,7 +1293,13 @@ def _next_digital_fallback(current_extractor: str) -> Optional[str]:
     except ValueError:
         return None
     for candidate in _DIGITAL_CHAIN[idx + 1:]:
-        if candidate == "mineru" and _mineru_available():
+        if candidate == "marker" and _marker_available():
+            return candidate
+        elif candidate == "docling" and _docling_available():
+            return candidate
+        elif candidate == "pymupdf4llm" and _pymupdf4llm_available():
+            return candidate
+        elif candidate == "mineru" and _mineru_available():
             return candidate
         elif candidate == "tesseract" and _tesseract_available():
             return candidate
@@ -1012,6 +1395,7 @@ def _rerender_page_pdftoppm(pdf_path: Path, page_num: int,
                 return False
 
             shutil.copy2(rendered[0], output_path)
+            _ensure_max_dimension(output_path)
             return True
         except subprocess.TimeoutExpired:
             _warn(f"pdftoppm timed out for page {page_num}")
@@ -1263,6 +1647,14 @@ def _extract_fitz_fallback_images(
                 _warn(f"F16: could not write fallback image "
                       f"{new_name}: {e}")
                 continue
+            if _ensure_max_dimension(new_path):
+                # Re-read dimensions after resize
+                try:
+                    from PIL import Image as _PILDim  # noqa: PLC0415
+                    with _PILDim.open(new_path) as _resized:
+                        w, h = _resized.size
+                except Exception:
+                    pass
 
             # Check for near-black
             is_black = _is_near_black(new_path)
@@ -1497,15 +1889,18 @@ def _normalize_mineru_output(
                 else:
                     # Fallback: copy the near-black image anyway
                     shutil.copy2(img_path, new_path)
+                    _ensure_max_dimension(new_path)
                     print(f"    WARN: Could not re-render page {page_num}. "
                           "Keeping near-black image.")
             else:
                 # No page info: copy as-is
                 shutil.copy2(img_path, new_path)
+                _ensure_max_dimension(new_path)
                 print(f"    WARN: No page info for near-black image. "
                       "Keeping as-is.")
         else:
             shutil.copy2(img_path, new_path)
+            _ensure_max_dimension(new_path)
 
         # Map old MinerU relative path to new filename
         # MinerU markdown uses: ![](images/hash.jpg) or ![](tables/hash.jpg)
@@ -1632,6 +2027,7 @@ def _normalize_mineru_output(
         "folkehelseinstituttet", "table of contents", "contents",
         "systematic review", "rapid review", "technology appraisal",
         "evidence report", "clinical practice guideline",
+        "erasmus school of health policy", "university of oslo", "uio",
     ]
     _mineru_title = "Unknown"
     for _line in md_content.split('\n')[:80]:
@@ -1676,6 +2072,7 @@ def _normalize_mineru_output(
         f"fitz_fallback_images: {_fitz_fallback_count}\n"
         f"near_black_images: {near_black_count}\n"
         f"rerendered_images: {rerendered_count}\n"
+        f"image_notes: {'pending' if _total_image_count > 0 else 'none'}\n"
         "---\n\n"
     )
 
@@ -1690,6 +2087,29 @@ def _normalize_mineru_output(
     # ── 8. Write the normalized markdown ──
     pipeline_output_md.parent.mkdir(parents=True, exist_ok=True)
     pipeline_output_md.write_text(final_content, encoding="utf-8")
+
+    # ── 8b. Fix 3.6/M1: Classify MinerU images (remove bypass) ──
+    # MinerU-extracted images previously skipped the classification chain
+    # that pymupdf4llm images go through.  Run _classify_single_image()
+    # on each manifest entry so decorative images are properly flagged.
+    _mineru_dec_count = 0
+    for _mi in manifest_images:
+        # Build a minimal page_data dict for the classifier
+        _mi_page_data = {
+            "page": _mi.get("page", 0),
+            "context": (_mi.get("section_context", {}).get("heading", "")
+                        + " " + (_mi.get("detected_caption") or "")),
+            "full_text": (_mi.get("section_context", {}).get("heading", "")
+                          + " " + (_mi.get("detected_caption") or "")),
+        }
+        # xref_counts not available for MinerU images; pass empty dict
+        _classify_single_image(
+            _mi, _mi_page_data, xref_counts={}, total_pages=page_count)
+        if not _mi.get("is_substantive", True):
+            _mineru_dec_count += 1
+    if _mineru_dec_count > 0:
+        print(f"  Fix 3.6: Classified {_mineru_dec_count} MinerU image(s) "
+              f"as decorative")
 
     # ── 9. Write the image manifest ──
     manifest_data = {
@@ -1848,12 +2268,20 @@ def _trigger_mineru_fallback(
 
         print(f"  MinerU output found: {mineru_auto_dir}")
 
-        # ── Clear old pymupdf4llm artifacts ──
-        # Remove old .md and images so normalization writes cleanly
+        # ── Back up pymupdf4llm artifacts (restore on failure) ──
+        # BUG FIX (S61): Previously deleted pymupdf4llm output BEFORE
+        # verifying MinerU normalization succeeded.  When MinerU failed,
+        # both outputs were lost.  Now we rename to .bak, attempt MinerU,
+        # and restore on failure.
+        _backup_md = output_md.with_suffix(".md.pymupdf4llm_backup")
+        _backup_images = (
+            images_dir.with_name(images_dir.name + "_pymupdf4llm_backup")
+            if images_dir.exists() else None
+        )
         if output_md.exists():
-            output_md.unlink()
-        if images_dir.exists():
-            shutil.rmtree(images_dir, ignore_errors=True)
+            output_md.rename(_backup_md)
+        if _backup_images and images_dir.exists():
+            images_dir.rename(_backup_images)
 
         # ── Normalize MinerU output ──
         success = _normalize_mineru_output(
@@ -1867,9 +2295,20 @@ def _trigger_mineru_fallback(
         )
 
         if not success:
+            # ── Restore pymupdf4llm output ──
+            if _backup_md.exists():
+                _backup_md.rename(output_md)
+            if _backup_images and _backup_images.exists():
+                _backup_images.rename(images_dir)
             _warn("MinerU normalization failed. "
-                  "pymupdf4llm output was already removed.")
+                  "Restored pymupdf4llm output.")
             return False
+
+        # ── MinerU succeeded — clean up backups ──
+        if _backup_md.exists():
+            _backup_md.unlink()
+        if _backup_images and _backup_images.exists():
+            shutil.rmtree(_backup_images, ignore_errors=True)
 
     # ── Update checkpoint ──
     checkpoint["extractor"] = "mineru"
@@ -2143,17 +2582,6 @@ def update_registry_organized(source_hash: str, source_file: Path,
     """
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    registry = {"conversions": []}
-    if REGISTRY_PATH.exists():
-        try:
-            with open(REGISTRY_PATH) as f:
-                registry = json.load(f)
-            if not isinstance(registry, dict) or "conversions" not in registry:
-                raise ValueError("malformed registry")
-        except (json.JSONDecodeError, ValueError) as e:
-            _warn(f"Registry corrupt ({e}). Using empty registry for R10 update.")
-            registry = {"conversions": []}
-
     originals_dir = target_dir / ORIGINALS_SUBDIR
 
     new_entry = {
@@ -2187,27 +2615,50 @@ def update_registry_organized(source_hash: str, source_file: Path,
         new_entry["has_testable_images"] = image_index_meta.get(
             "has_testable_images", False)
 
-    # Remove existing entry with same hash AND same target_dir (dedup)
-    # Preserve v3.0 entries that lack organized_* fields
-    kept = []
-    for entry in registry.get("conversions", []):
-        if entry.get("source_hash") == source_hash:
-            entry_target = entry.get("target_dir", "")
-            if entry_target and Path(entry_target).resolve() == target_dir.resolve():
-                continue  # Replace this entry
-            if not entry_target and "organized_source_path" not in entry:
-                # v3.0 entry without target_dir: preserve it
+    # Lock the entire read-modify-write cycle to prevent concurrent
+    # lost updates (MINOR-2 fix).
+    # NOTE: The .json.lock file is intentionally persistent (never deleted).
+    # fcntl.flock() works on existing files, and keeping the file avoids a
+    # race condition where two processes try to create it simultaneously.
+    _lock_path = REGISTRY_PATH.with_suffix(".json.lock")
+    with open(_lock_path, "w") as _lf:
+        fcntl.flock(_lf, fcntl.LOCK_EX)
+        try:
+            registry = {"conversions": []}
+            if REGISTRY_PATH.exists():
+                try:
+                    with open(REGISTRY_PATH) as f:
+                        registry = json.load(f)
+                    if not isinstance(registry, dict) or "conversions" not in registry:
+                        raise ValueError("malformed registry")
+                except (json.JSONDecodeError, ValueError) as e:
+                    _warn(f"Registry corrupt ({e}). Using empty registry for R10 update.")
+                    registry = {"conversions": []}
+
+            # Remove existing entry with same hash AND same target_dir (dedup)
+            # Preserve v3.0 entries that lack organized_* fields
+            kept = []
+            for entry in registry.get("conversions", []):
+                if entry.get("source_hash") == source_hash:
+                    entry_target = entry.get("target_dir", "")
+                    if entry_target and Path(entry_target).resolve() == target_dir.resolve():
+                        continue  # Replace this entry
+                    if not entry_target and "organized_source_path" not in entry:
+                        # v3.0 entry without target_dir: preserve it
+                        kept.append(entry)
+                        continue
                 kept.append(entry)
-                continue
-        kept.append(entry)
 
-    kept.append(new_entry)
-    registry["conversions"] = kept
+            kept.append(new_entry)
+            registry["conversions"] = kept
 
-    tmp_path = REGISTRY_PATH.with_suffix(".json.tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(registry, f, indent=2)
-    tmp_path.replace(REGISTRY_PATH)
+            # Atomic write: temp file then replace
+            tmp_path = REGISTRY_PATH.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(registry, f, indent=2)
+            tmp_path.replace(REGISTRY_PATH)
+        finally:
+            fcntl.flock(_lf, fcntl.LOCK_UN)
 
     print(f"\n  Registry updated (R10): {REGISTRY_PATH}")
     print(f"    organized_source_path: {new_entry['organized_source_path']}")
@@ -2600,17 +3051,24 @@ def _is_blank_image(img_path: str,
 
 
 def _is_journal_branding(img_detail: dict,
-                         file_size_bytes: int = 0) -> bool:
-    """FIX-3: Detect journal branding elements.
+                         file_size_bytes: int = 0,
+                         page_num: int = 0,
+                         page_image_count: int = 0) -> bool:
+    """FIX-3 (S36 enhanced): Detect journal branding elements.
 
     Identifies common decorative elements in journal PDFs:
-      - Very small images (width < 100px OR height < 100px)
-      - Extreme aspect ratios (> 10:1 or < 1:10) — banners/bars
-      - Tiny file size (< 5KB) — icons/badges
+      - Check 1: Very small images (width < 100px AND height < 100px)
+      - Check 2: Extreme aspect ratios (> 10:1 or < 1:10) -- banners/bars
+      - Check 3: Tiny file size (< 5KB) with relaxed dimension gate
+      - Check 4: Page-1 moderate images on multi-image pages (NEW S36)
+      - Check 5: Page-1 high-image-count website extraction (NEW S36)
+      - Check 6: Page-1 small images regardless of count (NEW S36)
 
     Args:
         img_detail: Dict with width, height keys.
         file_size_bytes: File size in bytes (0 = unknown/skip check).
+        page_num: Page number (1-indexed). 0 = unknown. (S36)
+        page_image_count: Total images on this page. 0 = unknown. (S36)
 
     Returns True if the image is likely journal branding / decorative.
     """
@@ -2621,14 +3079,14 @@ def _is_journal_branding(img_detail: dict,
     if w <= 0 or h <= 0:
         return False
 
-    # Very small images (icons, badges, bullets)
+    # S36: Check 1: Very small images (icons, badges, bullets) [unchanged]
     # BOTH dimensions must be small to avoid false positives on
     # narrow-but-tall images (gel lanes ~80x400px) or wide-but-short
     # images (spectral traces ~500x60px).
     if w < 100 and h < 100:
         return True
 
-    # Extreme aspect ratio (banners, colored bars, dividers)
+    # S36: Check 2: Extreme aspect ratio (banners, colored bars, dividers) [unchanged]
     # GATED on file_size < 5KB: legitimate wide/tall process diagrams
     # can have extreme aspect ratios but are typically > 5KB file size.
     # When file_size is unknown (0), still apply the filter (conservative).
@@ -2638,13 +3096,45 @@ def _is_journal_branding(img_detail: dict,
             return True
         # Large file with extreme aspect: likely a real diagram, do not filter
 
-    # Tiny file size (< 5KB) — icons, badges, CC logos
-    # GATED on small dimensions: a 2KB image at 200x300px is likely a
-    # legitimate simple diagram, but a 3KB image at 50x10px is a watermark.
-    # Without the dimension gate, this false-positives images like
-    # fig62-page39.png (2,080B, confirmed SUB).
+    # S36: Check 3 (RELAXED): Tiny file size (< 5KB)
+    # OLD: w < 200 AND h < 200 (missed SAGE logo 669x219 at 4KB)
+    # S36-FIX: Page 1 uses relaxed OR gate (catches wide logos like SAGE
+    # 669x219 at 4KB). Other pages use original AND gate to avoid killing
+    # legitimate small diagrams (e.g. 500x300 sparkline at 4.5KB).
     if 0 < file_size_bytes < 5000:
-        if w < 200 and h < 200:
+        if page_num == 1:
+            # S36-FIX: CRITICAL-01 - Relaxed gate for page 1 only
+            if w < 400 or h < 400:
+                return True
+        else:
+            # S36-FIX: CRITICAL-01 - Original AND gate for non-page-1
+            if w < 200 and h < 200:
+                return True
+
+    # S36: Check 4 (NEW): Page-1 small-to-medium images on multi-image pages
+    # On page 1 with >3 images, images under ~50KB with moderate dimensions
+    # are very likely journal/publisher branding. Real paper figures are
+    # typically >50KB and appear on later pages.
+    if page_num == 1 and page_image_count > 3:
+        if 0 < file_size_bytes < 50000:
+            if w < 500 and h < 500:
+                return True
+
+    # S36: Check 5 (NEW): Page-1 high-image-count = journal website extraction
+    # When page 1 has >8 images, almost all are decorative website elements.
+    # Only very large images (>100KB) should escape this filter.
+    # S36-FIX: MAJOR-01 - Added > 0 guard. When file_size_bytes is 0
+    # (unknown), 0 < 100000 would be TRUE, falsely classifying all
+    # unknown-size images as branding.
+    if page_num == 1 and page_image_count > 8:
+        if 0 < file_size_bytes < 100000:
+            return True
+
+    # S36: Check 6 (NEW): Page-1 small images regardless of image count
+    # Journal covers and publisher logos on page 1 are typically <300x300
+    # and <50KB. A real paper figure at this size would be unusual.
+    if page_num == 1:
+        if w < 300 and h < 300 and 0 < file_size_bytes < 50000:
             return True
 
     return False
@@ -2703,14 +3193,19 @@ def _classify_single_image(
         img["classification_reason"] = "tiny_dimensions"
         return
 
-    # [3] H9/FIX-3: JOURNAL BRANDING
+    # [3] H9/FIX-3: JOURNAL BRANDING (S36 enhanced with page context)
     _file_size = 0
     if file_path:
         try:
             _file_size = _os_classify.path.getsize(file_path)
         except OSError:
             pass
-    if _is_journal_branding(img, file_size_bytes=_file_size):
+    # S36: Extract page-level info for branding check
+    _page_num = page_data.get("page", 0)
+    _page_image_count = page_data.get("image_count", 0)
+    if _is_journal_branding(img, file_size_bytes=_file_size,
+                            page_num=_page_num,
+                            page_image_count=_page_image_count):
         img["is_substantive"] = False
         img["classification_reason"] = "journal_branding"
         return
@@ -3466,20 +3961,34 @@ def _update_manifest_with_vector_renders(
                 manifest_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError):
             data = {"images": [], "image_count": 0,
-                    "total_images": 0}
+                    "total_images": 0,
+                    "images_dir": str(images_dir),
+                    "md_file": str(output_md),
+                    "source": str(output_md.parent / output_md.stem)}
     else:
         manifest_path = images_dir / "image-manifest.json"
         data = {"images": [], "image_count": 0,
-                "total_images": 0}
+                "total_images": 0,
+                "images_dir": str(images_dir),
+                "md_file": str(output_md),
+                "source": str(output_md.parent / output_md.stem)}
 
     existing_filenames = {
         img.get("filename") for img in data.get("images", [])}
 
     added = 0
-    for vr in vector_rendered:
+    base_fig = max(
+        (fn for fn in
+         (img.get("figure_num", 0) for img in data.get("images", []))
+         if isinstance(fn, (int, float))),
+        default=0,
+    )
+    for idx, vr in enumerate(vector_rendered, start=1):
         if vr["filename"] in existing_filenames:
             continue
         entry = {
+            "index": len(data.get("images", [])),
+            "figure_num": base_fig + idx,
             "filename": vr["filename"],
             "file_path": vr["file_path"],
             "width": vr["width"],
@@ -3493,6 +4002,9 @@ def _update_manifest_with_vector_renders(
             "analysis_status": "pending",
             "description": (f"Vector-rendered page {vr['page']} "
                             f"({vr['drawing_count']} drawings)"),
+            "type_guess": "vector_render",
+            "section_context": "",
+            "detected_caption": None,
         }
         data.setdefault("images", []).append(entry)
         added += 1
@@ -4053,6 +4565,14 @@ def generate_image_index(source_path: Path,
                             # vector pages.
                             _pix_w, _pix_h = pix.width, pix.height
                             del pix
+                            if _ensure_max_dimension(render_path):
+                                # Re-read dimensions after resize
+                                try:
+                                    from PIL import Image as _PILDim
+                                    with _PILDim.open(render_path) as _resized:
+                                        _pix_w, _pix_h = _resized.size
+                                except Exception:
+                                    pass
                             # Update page data to reflect the rendered image
                             page_data["image_count"] = 1
                             page_data["image_details"] = [{
@@ -4086,6 +4606,26 @@ def generate_image_index(source_path: Path,
             if vector_rendered:
                 _update_manifest_with_vector_renders(
                     output_md, vector_rendered, images_dir_for_vectors)
+
+                # FIX-1.7: Update YAML image_notes from "none" to "pending"
+                # when vector renders were added. Step 3 sets image_notes
+                # based on raster count (which may be 0), but vector renders
+                # discovered here mean images DO exist for analysis.
+                try:
+                    _yaml_content = output_md.read_text(encoding="utf-8")
+                    if "image_notes: none" in _yaml_content:
+                        _yaml_content = _yaml_content.replace(
+                            "image_notes: none",
+                            "image_notes: pending",
+                            1,  # replace only the first occurrence (YAML header)
+                        )
+                        output_md.write_text(_yaml_content, encoding="utf-8")
+                        print(f"  FIX-1.7: Updated YAML image_notes: "
+                              f"none → pending ({len(vector_rendered)} "
+                              f"vector render(s))")
+                except Exception as _yaml_e:
+                    _warn(f"Could not update YAML image_notes "
+                          f"after vector renders: {_yaml_e}")
 
     # Build xref-to-filepath map for per-image classification.
     # Must run AFTER FIX-1 (vector renders need to be in images_dir)
@@ -4146,6 +4686,13 @@ def generate_image_index(source_path: Path,
         # Track decorative files per page for page-level reclassification
         _page_decorative: dict = {}  # page_num -> set of decorative filenames
         _page_total: dict = {}       # page_num -> set of all filenames
+
+        # S36-FIX: MAJOR-02 - Two-pass approach. First pass builds complete
+        # _page_total so that ALL files on a page are counted before any
+        # classification decisions use page_image_count. Without this, early
+        # files on a page see an incomplete count (e.g. first file sees 1,
+        # second sees 2) causing inconsistent branding decisions.
+        _img_file_list = []  # (Path, page_num_or_None) pairs
         if _imgs_dir is not None:
             for _img_file in sorted(_imgs_dir.iterdir()):
                 if not _img_file.is_file():
@@ -4173,7 +4720,10 @@ def generate_image_index(source_path: Path,
                 if _pg_num is not None:
                     _page_total.setdefault(_pg_num, set()).add(
                         _img_file.name)
+                _img_file_list.append((_img_file, _pg_num))
 
+            # S36-FIX: MAJOR-02 - Second pass: classify with complete counts
+            for _img_file, _pg_num in _img_file_list:
                 _is_dec = False
                 # Check 1: blank/color-block/dark-cover via enhanced
                 # _is_blank_image (includes M1/M2 heuristics)
@@ -4183,6 +4733,7 @@ def generate_image_index(source_path: Path,
                 # _is_journal_branding requires width/height; read from
                 # PIL if available.  This catches small file-size images
                 # (< 5KB) that are not caught by _is_blank_image.
+                # S36: Pass page_num and page_image_count for enhanced checks.
                 if not _is_dec:
                     try:
                         import os as _os_f2
@@ -4195,9 +4746,16 @@ def generate_image_index(source_path: Path,
                             _f2_img.close()
                         except Exception:
                             pass
+                        # S36-FIX: MAJOR-02 - Use complete page count
+                        _f2_pg_img_count = (
+                            len(_page_total.get(_pg_num, set()))
+                            if _pg_num is not None else 0
+                        )
                         if _is_journal_branding(
                                 {"width": _f2_w, "height": _f2_h},
-                                file_size_bytes=_f2_size):
+                                file_size_bytes=_f2_size,
+                                page_num=_pg_num or 0,
+                                page_image_count=_f2_pg_img_count):
                             _is_dec = True
                     except Exception:
                         pass
@@ -5346,7 +5904,7 @@ def _post_process_markdown(md_text: str) -> str:
     Passes applied:
       F11b – Bold ** marker stripping from heading lines
       F8   – CJK artifact filter (isolated + clustered CJK in Latin context,
-              institutional logo footer artifacts)
+              Erasmus logo footer artifacts)
       F9   – Garbled OCR block detection with warning markers
       F12  – Euro symbol restoration ("AC" → "€" before digits)
       F15  – Table caption "Table" prefix restoration
@@ -5385,7 +5943,7 @@ def _post_process_markdown(md_text: str) -> str:
         '',
         md_text,
     )
-    # F8c: institutional logo footer artifacts ("Erafmy", "Ezamy", variants)
+    # F8c: Erasmus logo footer artifacts ("Erafmy", "Ezamy", variants)
     md_text = re.sub(r'E[rz]a[fm]y', '', md_text, flags=re.IGNORECASE)
 
     # ── F9: Garbled OCR block detection with warning markers ─────────────
@@ -5475,6 +6033,72 @@ def _post_process_markdown(md_text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# FIX 3.12: Image-Markdown Sync
+# ═══════════════════════════════════════════════════════════════════════════
+
+def sync_images_to_md(md_path: Path, manifest_path: Path) -> bool:
+    """Replace 'No images extracted' placeholder with image index.
+
+    Fix 3.12: After image extraction, the manifest may contain images but
+    the markdown text may still say 'No images extracted.'  This function
+    scans the MD for that placeholder and replaces it with a proper image
+    index table built from the manifest.
+
+    Returns True if the placeholder was found and replaced, False otherwise.
+    """
+    if not md_path.exists() or not manifest_path.exists():
+        return False
+
+    md_content = md_path.read_text(encoding='utf-8')
+    if 'No images extracted' not in md_content:
+        return False  # Nothing to fix
+
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    images = manifest.get("images", [])
+    if not images:
+        return False
+
+    # Build image index table (no heading — the MD already has ## Image Index)
+    # Filter to substantive images only (backward compat: keep all if fields missing)
+    substantive = []
+    excluded_count = 0
+    for img in images:
+        has_filter_fields = any(
+            k in img for k in ("is_substantive", "is_blank", "is_duplicate")
+        )
+        if has_filter_fields:
+            if img.get("is_blank", False) or img.get("is_duplicate", False):
+                excluded_count += 1
+                continue
+            if "is_substantive" in img and not img.get("is_substantive", True):
+                excluded_count += 1
+                continue
+        substantive.append(img)
+
+    index_lines = ["| Figure | File | Page | Size |",
+                   "|--------|------|------|------|"]
+    for img in substantive:
+        fn = img.get("filename", "")
+        pg = img.get("page", "?")
+        w = img.get("width", "?")
+        h = img.get("height", "?")
+        fig = img.get("figure_num", "?")
+        index_lines.append(f"| {fig} | {fn} | {pg} | {w}x{h} |")
+
+    if excluded_count > 0:
+        index_lines.append(
+            f"\n*Showing {len(substantive)} substantive images. "
+            f"{excluded_count} decorative/blank/duplicate images excluded.*"
+        )
+
+    index_text = "\n".join(index_lines)
+    md_content = md_content.replace(
+        "No images extracted.", index_text)
+    md_path.write_text(md_content, encoding='utf-8')
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -5509,7 +6133,7 @@ Examples:
                         help="Skip number extraction (for non-PDF)")
     parser.add_argument("--force-extractor", type=str, default=None,
                         choices=["pymupdf4llm", "tesseract", "mineru",
-                                 "zerox"],
+                                 "zerox", "docling", "marker"],
                         help="Force a specific extractor "
                              "(bypass auto-detection)")
     parser.add_argument("--skip-cross-validation", action="store_true",
@@ -5564,7 +6188,24 @@ Examples:
                              "conversion or run standalone with an "
                              "input file.")
 
+    # ── Issue reporting flags ──────────────────────────────────────────────
+    parser.add_argument('--report-issue', action='store_true',
+                        help='Interactively write a pipeline issue report '
+                             'to the reports folder')
+    parser.add_argument('--health-check', action='store_true',
+                        help='Read all pipeline reports and show unresolved '
+                             'issues')
+
     args = parser.parse_args()
+
+    # ── Issue reporting early exits ────────────────────────────────────────
+    if args.health_check:
+        run_health_check()
+        sys.exit(0)
+
+    if args.report_issue:
+        interactive_report_issue()
+        sys.exit(0)
 
     # ── R20: Standalone --generate-testable-index mode ────────────────────
     # When --generate-testable-index is provided WITHOUT an input file,
@@ -5634,6 +6275,12 @@ Examples:
                   or args.input_file.stem.lower().replace(" ", "-"))
     images_dir = (args.images_dir
                   or (output_md.parent / "images" / short_name))
+
+    # ── Compute source hash ONCE, early ─────────────────────────────────
+    # SHA-256 is needed for registry updates, duplicate detection, and
+    # organization tracking.  Compute it here while args.input_file is
+    # guaranteed to exist (before Step 8 moves it to _originals/).
+    source_hash = _compute_sha256(args.input_file)
 
     # ── R13: Excel/XLSX graceful skip ─────────────────────────────────────
     # XLSX files are NEVER converted (lossy: formulas become strings).
@@ -5800,6 +6447,7 @@ Examples:
             except Exception as e:
                 _warn(f"Scan detection failed: {e}. "
                       "Assuming digital, using pymupdf4llm.")
+                check_for_known_failures(str(e), context="Step 0: Extractor Selection")
                 extractor_config = ExtractorConfig(
                     extractor="pymupdf4llm",
                     script=str(SCRIPTS_DIR / "convert-paper.py"),
@@ -5846,7 +6494,14 @@ Examples:
                 "--output-dir", str(output_md.parent),
             ]
 
-        exit_code = run_command(cmd, "Step 1: Text + Image Extraction")
+        # Marker wrapper has internal 600s timeout per attempt (1,200s
+        # total with CPU retry).  Outer timeout of 1,500s provides
+        # headroom for postprocessing (NFC, ligatures, run-togethers).
+        _step1_timeout = (1500 if (extractor_config
+                                   and extractor_config.extractor == "marker")
+                          else None)
+        exit_code = run_command(cmd, "Step 1: Text + Image Extraction",
+                               timeout=_step1_timeout)
 
         # ── BUG-4 FIX: sync output_md for office formats ──
         # convert-office.py always names its output {input_stem}.md in
@@ -5863,6 +6518,22 @@ Examples:
                       f"output:\n  expected: {output_md}\n"
                       f"  actual:   {actual_office_md}")
                 output_md = actual_office_md
+                checkpoint["output_file"] = str(output_md.resolve())
+
+        # ── BUG-4b FIX: sync output_md for marker extractor ──
+        # convert-paper-marker.py always writes {input_stem}.md to the
+        # output directory.  When --output specifies a different basename,
+        # output_md points to a file that marker never writes.  Same bug
+        # class as BUG-4 for office formats above.
+        if (exit_code == 0 and fmt == "pdf"
+                and extractor_config
+                and extractor_config.extractor == "marker"):
+            actual_marker_md = output_md.parent / f"{args.input_file.stem}.md"
+            if actual_marker_md.exists() and actual_marker_md != output_md:
+                print(f"\nINFO: output_md updated to match marker output:\n"
+                      f"  expected: {output_md}\n"
+                      f"  actual:   {actual_marker_md}")
+                output_md = actual_marker_md
                 checkpoint["output_file"] = str(output_md.resolve())
 
         # ── R19: Discover image index written by convert-office.py ──
@@ -5989,7 +6660,7 @@ Examples:
         # extractor in the appropriate chain before giving up.
         #
         # Scanned chain: tesseract -> mineru -> zerox
-        # Digital chain: pymupdf4llm -> mineru -> tesseract
+        # Digital chain: marker -> docling -> pymupdf4llm -> mineru -> tesseract
         #
         # BUG FIX: the original code only ran fallbacks when is_scanned
         # was True. Digital PDFs that cause pymupdf4llm to crash (e.g.
@@ -6001,21 +6672,31 @@ Examples:
             while exit_code != 0:
                 if extractor_config.is_scanned:
                     fallback = _next_scanned_fallback(current)
+                    if fallback is None:
+                        # Forced extractor not in scanned chain — try digital chain
+                        fallback = _next_digital_fallback(current)
                 else:
                     fallback = _next_digital_fallback(current)
                 if fallback is None:
                     break
                 _warn(f"{current} failed at runtime. "
                       f"Trying fallback: {fallback}")
+                # Determine script path for fallback extractor
+                if fallback == "marker":
+                    _fb_script = _MARKER_WRAPPER
+                elif fallback == "mineru":
+                    _fb_script = str(SCRIPTS_DIR / "convert-mineru.py")
+                elif fallback == "zerox":
+                    _fb_script = str(
+                        SCRIPTS_DIR / f"convert-{fallback}.py")
+                else:
+                    _fb_script = str(SCRIPTS_DIR / "convert-paper.py")
                 extractor_config = ExtractorConfig(
                     extractor=fallback,
-                    script=(str(SCRIPTS_DIR / "convert-mineru.py")
-                            if fallback == "mineru"
-                            else str(SCRIPTS_DIR / f"convert-{fallback}.py")
-                            if fallback == "zerox"
-                            else str(SCRIPTS_DIR / "convert-paper.py")),
+                    script=_fb_script,
                     extra_args=(["--extractor", fallback]
-                                if fallback in ("pymupdf4llm", "tesseract")
+                                if fallback in ("pymupdf4llm", "tesseract",
+                                                "docling")
                                 else []),
                     is_scanned=extractor_config.is_scanned,
                     avg_chars_per_page=(
@@ -6029,9 +6710,11 @@ Examples:
                     fallback, args.input_file,
                     output_md, images_dir, short_name, args.no_images,
                 )
+                _fb_timeout = 1500 if fallback == "marker" else None
                 exit_code = run_command(
                     cmd,
                     f"Step 1 (fallback): {fallback}",
+                    timeout=_fb_timeout,
                 )
                 current = fallback
 
@@ -6043,10 +6726,97 @@ Examples:
 
         # ── Step 1b: Cross-Validation (PDF + pymupdf4llm only) ──
         cross_val_flags = []
-        if (fmt == "pdf"
-                and extractor_config
-                and extractor_config.extractor == "pymupdf4llm"
+        _is_pymupdf_cv = (fmt == "pdf"
+                          and extractor_config
+                          and extractor_config.extractor == "pymupdf4llm"
+                          and not args.skip_cross_validation)
+        if (fmt == "pdf" and extractor_config
+                and extractor_config.extractor != "pymupdf4llm"
                 and not args.skip_cross_validation):
+            print(f"\n  Step 1b: Cross-validation skipped "
+                  f"(not applicable for {extractor_config.extractor} "
+                  f"extractor)")
+
+            # ── Quality gate: word-count ratio vs fitz ──
+            # Full cross-validation only exists for pymupdf4llm (uses
+            # pdfplumber as reference). For other extractors, compare
+            # word count against fitz raw text as a lightweight check.
+            if extractor_config.extractor in ("docling", "marker") and output_md.exists():
+                _gate_name = extractor_config.extractor.capitalize()
+                _gate_critical = _extractor_quality_gate(
+                    _gate_name, output_md, args.input_file)
+                if _gate_critical:
+                    # Critically empty output (<10%): re-enter fallback
+                    # chain from the current extractor position.
+                    exit_code = 1
+                    print(f"  Quality gate CRITICAL: forcing fallback")
+                    current = extractor_config.extractor
+                    while exit_code != 0:
+                        fallback = _next_digital_fallback(current)
+                        if fallback is None:
+                            break
+                        _warn(f"{current} quality gate failed. "
+                              f"Trying fallback: {fallback}")
+                        if fallback == "marker":
+                            _fb_script = _MARKER_WRAPPER
+                        elif fallback == "mineru":
+                            _fb_script = str(
+                                SCRIPTS_DIR / "convert-mineru.py")
+                        elif fallback == "zerox":
+                            _fb_script = str(
+                                SCRIPTS_DIR / f"convert-{fallback}.py")
+                        else:
+                            _fb_script = str(
+                                SCRIPTS_DIR / "convert-paper.py")
+                        extractor_config = ExtractorConfig(
+                            extractor=fallback,
+                            script=_fb_script,
+                            extra_args=(
+                                ["--extractor", fallback]
+                                if fallback in ("pymupdf4llm",
+                                                "tesseract", "docling")
+                                else []),
+                            is_scanned=extractor_config.is_scanned,
+                            avg_chars_per_page=(
+                                extractor_config.avg_chars_per_page),
+                            page_count=extractor_config.page_count,
+                        )
+                        cmd = _build_cmd_for_extractor(
+                            fallback, args.input_file,
+                            output_md, images_dir, short_name,
+                            args.no_images,
+                        )
+                        # MAJOR-QC-2: Update checkpoint so crash
+                        # recovery knows which extractor was used.
+                        checkpoint["extractor"] = fallback
+                        checkpoint["fallback_chain"] = checkpoint.get(
+                            "fallback_chain", []) + [current]
+                        _fb_timeout = (1500 if fallback == "marker"
+                                       else None)
+                        exit_code = run_command(
+                            cmd,
+                            f"Step 1 (quality-gate fallback): "
+                            f"{fallback}",
+                            timeout=_fb_timeout,
+                        )
+                        # MAJOR-QC-1: Re-check quality of fallback
+                        # output. A fallback that exits 0 but produces
+                        # empty output must not pass silently.
+                        if exit_code == 0 and output_md.exists():
+                            _fb_gate_name = fallback.capitalize()
+                            _fb_gate_critical = _extractor_quality_gate(
+                                _fb_gate_name, output_md, args.input_file)
+                            if _fb_gate_critical:
+                                print(f"  Quality gate CRITICAL for "
+                                      f"{fallback}: forcing next fallback")
+                                exit_code = 1  # Continue fallback loop
+                        current = fallback
+                    if exit_code != 0:
+                        _fail("Quality gate fallback failed - "
+                              "all extractors exhausted",
+                              checkpoint, checkpoint_path)
+
+        if _is_pymupdf_cv:
             print(f"\n{'─' * 40}")
             print("Step 1b: Cross-Validation (pdfplumber)")
             print('─' * 40)
@@ -6354,6 +7124,47 @@ Examples:
                 _warn(f"F14 domain detection failed "
                       f"(non-fatal): {_f14_err}")
 
+        # ── Fix 3.12: Image-Markdown Sync ──
+        # After image extraction (Step 1), the manifest may list images but
+        # the MD may still contain the "No images extracted." placeholder.
+        # Sync the MD with the manifest by replacing the placeholder with
+        # an image index table.  Must run BEFORE Step 2 QC gate to avoid
+        # manifest/index count mismatches.
+        if output_md.exists():
+            # Build manifest candidate list (same logic as Step 3 but
+            # needed here before Step 2)
+            _sync_manifest_candidates = [
+                images_dir / "image-manifest.json",
+            ]
+            # Office formats: manifest at output_md.parent
+            _sync_input_stem = args.input_file.stem
+            _sync_short = short_name
+            _sync_manifest_candidates.append(
+                output_md.parent / f"{_sync_input_stem}_manifest.json")
+            if _sync_short != _sync_input_stem:
+                _sync_manifest_candidates.append(
+                    output_md.parent / f"{_sync_short}_manifest.json")
+
+            _sync_manifest = None
+            for _cand in _sync_manifest_candidates:
+                if _cand.exists():
+                    _sync_manifest = _cand
+                    break
+
+            if _sync_manifest is not None:
+                try:
+                    _synced = sync_images_to_md(output_md, _sync_manifest)
+                    if _synced:
+                        print("  Fix 3.12: Synced MD with manifest "
+                              "(replaced 'No images extracted' "
+                              "placeholder with image index)")
+                    else:
+                        print("  Fix 3.12: No sync needed "
+                              "(placeholder absent or no images)")
+                except Exception as _sync_err:
+                    _warn(f"Fix 3.12 image-markdown sync failed "
+                          f"(non-fatal): {_sync_err}")
+
         # ── Write checkpoint before QC ──
         try:
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6369,7 +7180,8 @@ Examples:
         # file is present before the QC gate.
         if (fmt == "pdf"
                 and extractor_config is not None
-                and extractor_config.extractor == "mineru"):
+                and extractor_config.extractor == "mineru"
+                and not args.no_images):
             try:
                 print(f"\n{'─' * 40}")
                 print("Step 1c: Early Image Index (MinerU pre-QC)")
@@ -6562,25 +7374,30 @@ Examples:
         # Generates per-file image manifest alongside the .md file.
         # Result is stored in _image_index_meta for R21 registry integration.
         _image_index_meta = None
-        try:
-            _image_index_meta = generate_image_index(
-                source_path=args.input_file,
-                output_md=output_md,
-                fmt=fmt,
-                target_dir=(args.target_dir.resolve()
-                            if args.target_dir else None),
-                images_dir=images_dir,  # BUG-1 fix: pass slug subdir
-                extractor=(extractor_config.extractor
-                           if extractor_config else None),
-            )
-        except Exception as e:
-            _warn(f"Image index generation failed: {e}")
-            # Non-fatal: conversion already succeeded
+        if args.no_images:
+            print(f"\nStep 6c: SKIP (--no-images flag set)")
+        else:
+            try:
+                _image_index_meta = generate_image_index(
+                    source_path=args.input_file,
+                    output_md=output_md,
+                    fmt=fmt,
+                    target_dir=(args.target_dir.resolve()
+                                if args.target_dir else None),
+                    images_dir=images_dir,  # BUG-1 fix: pass slug subdir
+                    extractor=(extractor_config.extractor
+                               if extractor_config else None),
+                )
+            except Exception as e:
+                _warn(f"Image index generation failed: {e}")
+                check_for_known_failures(str(e), context="Step 6c: Image Index Generation")
+                # Non-fatal: conversion already succeeded
 
         # R19 FIX: For DOCX/PPTX, generate_image_index() returns None
         # because convert-office.py handles it.  Use the metadata we
         # discovered earlier (after the subprocess call) as fallback.
-        if _image_index_meta is None and fmt in ("docx", "pptx"):
+        if (_image_index_meta is None and fmt in ("docx", "pptx")
+                and not args.no_images):
             _image_index_meta = _office_image_index_meta
 
         # ── m3: Apply overrides to PPTX/DOCX image index files ──
@@ -6622,6 +7439,62 @@ Examples:
                         except Exception:
                             pass  # Non-fatal
 
+        # ── Step 3b: Re-run prepare-image-analysis if Step 3 was skipped ──
+        # When extractor is marker (or any extractor that defers image
+        # manifest creation to Step 6c), Step 3 runs before the manifest
+        # exists and is skipped.  Step 6c then creates image-manifest.json
+        # and renders vector pages.  Without this re-run, no
+        # analysis-manifest.json is created and Step 4 (AI descriptions)
+        # is blocked.
+        #
+        # Conditions (ALL must be true):
+        #   1. image-manifest.json now exists (created/updated by Step 6c)
+        #   2. analysis-manifest.json does NOT yet exist
+        #   3. Images are not disabled (--no-images)
+        if not args.no_images and manifest_path.exists():
+            # Check all candidate locations for analysis-manifest.json
+            _step3b_analysis_candidates = [
+                images_dir / "analysis-manifest.json",
+            ]
+            if fmt != "pdf":
+                _step3b_office_images = (
+                    output_md.parent / f"{short_name}_images")
+                _step3b_analysis_candidates.append(
+                    _step3b_office_images / "analysis-manifest.json")
+                _step3b_stem_images = (
+                    output_md.parent / f"{args.input_file.stem}_images")
+                if _step3b_stem_images != _step3b_office_images:
+                    _step3b_analysis_candidates.append(
+                        _step3b_stem_images / "analysis-manifest.json")
+            _step3b_has_analysis = any(
+                p.exists() for p in _step3b_analysis_candidates)
+
+            if not _step3b_has_analysis:
+                print("\nStep 3b: Re-running prepare-image-analysis "
+                      "(manifest created by Step 6c)")
+                cmd = [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "prepare-image-analysis.py"),
+                    str(output_md),
+                    "--manifest", str(manifest_path)
+                ]
+                exit_code = run_command(
+                    cmd, "Step 3b: prepare-image-analysis.py (post-6c)",
+                    allow_failure=True
+                )
+                if exit_code != 0:
+                    print("\nWARNING: Step 3b (prepare-analysis re-run) "
+                          "failed. IMAGE NOTE generation can proceed "
+                          "without it.")
+                else:
+                    print("Step 3b: DONE")
+            else:
+                print("\nStep 3b: SKIP "
+                      "(analysis-manifest.json already exists)")
+        elif not args.no_images:
+            print("\nStep 3b: SKIP "
+                  "(no image-manifest.json from Step 6c)")
+
         # ── Update Registry ──
         # PDF: always write here (run-pipeline.py is the sole orchestrator for PDF).
         # Office (DOCX/PPTX/TXT): convert-office.py writes its own registry entry
@@ -6630,7 +7503,7 @@ Examples:
         # is harmless: dedup removes the older entry and keeps the newest.
         # XLSX is not routed here (early exit above); this branch never sees xlsx.
         if fmt == "pdf":
-            source_hash = _compute_sha256(args.input_file)
+            # source_hash computed early (before Step 8 file move)
             extractor_used = (extractor_config.extractor
                               if extractor_config else "pymupdf4llm")
             try:
@@ -6644,7 +7517,7 @@ Examples:
             # Office formats: write registry entry so the hook can find the .md
             # by SHA-256 even when the .md is in a different directory than the
             # source file (the primary correctness gap that Phase 4 fixes).
-            source_hash = _compute_sha256(args.input_file)
+            # source_hash computed early (before Step 8 file move)
             extractor_used = f"convert-office-{fmt}"
             try:
                 update_registry(args.input_file, output_md,
@@ -6713,7 +7586,7 @@ Examples:
         print(f"  4. generate-image-notes.md (Claude) - {output_md}")
         print(f"  5. validate-image-notes.py (Python) - {output_md}")
         if fmt == "pdf":
-            number_diff = output_md.parent / "number-diff-report.json"
+            number_diff = output_md.parent / f"{output_md.stem}-number-diff-report.json"
             if number_diff.exists():
                 print(f"  6b. qc-content-fidelity.md (Claude) - "
                       f"{output_md}")
@@ -6750,6 +7623,7 @@ Examples:
                     )
                 except Exception as e:
                     _warn(f"m2: Agent descriptions generation failed: {e}")
+                    check_for_known_failures(str(e), context="m2: Agent Descriptions")
             else:
                 _warn(f"m2: Image index not found at {_m2_idx_path}. "
                       "Skipping agent descriptions.")
@@ -6795,13 +7669,7 @@ Examples:
             target_dir.mkdir(parents=True, exist_ok=True)
         input_stem = args.input_file.stem
 
-        # Resolve actual source hash for organization tracking.
-        # source_hash may already be set from the registry update block
-        # (for pdf/docx/pptx/txt formats). Recompute only if not set.
-        try:
-            source_hash  # noqa: F841 — test if already bound
-        except NameError:
-            source_hash = _compute_sha256(args.input_file)
+        # source_hash already computed early (before Step 8 file move)
 
         # ── Tracking lists for R7 visual report ────────────────────────
         _report_move_actions = []
@@ -7067,6 +7935,34 @@ Examples:
             for action_type, desc in img_actions:
                 print(f"  {action_type}: {desc}")
                 _report_place_actions.append((action_type, desc))
+            # Fix 3.9/M8: Rewrite image paths in MD file after move
+            if not args.dry_run and target_md.exists():
+                _md_content_39 = target_md.read_text(encoding='utf-8')
+                _old_img_dir = source_images_dir.name
+                _new_img_dir = target_images_dir.name
+                if _old_img_dir != _new_img_dir:
+                    _md_changed_39 = False
+                    if f']({_old_img_dir}/' in _md_content_39:
+                        _md_content_39 = _md_content_39.replace(
+                            f']({_old_img_dir}/',
+                            f']({_new_img_dir}/')
+                        _md_changed_39 = True
+                    if f'src="{_old_img_dir}/' in _md_content_39:
+                        _md_content_39 = _md_content_39.replace(
+                            f'src="{_old_img_dir}/',
+                            f'src="{_new_img_dir}/')
+                        _md_changed_39 = True
+                    # MAJOR-3: Also rewrite paths inside IMAGE HTML comments
+                    if f'IMAGE: {_old_img_dir}/' in _md_content_39:
+                        _md_content_39 = _md_content_39.replace(
+                            f'IMAGE: {_old_img_dir}/',
+                            f'IMAGE: {_new_img_dir}/')
+                        _md_changed_39 = True
+                    if _md_changed_39:
+                        target_md.write_text(
+                            _md_content_39, encoding='utf-8')
+                        print(f"  REWRITTEN: MD image paths updated "
+                              f"({_old_img_dir} -> {_new_img_dir})")
         elif args.no_images:
             print("  SKIP: --no-images flag set, no images to place")
         else:
@@ -7162,6 +8058,7 @@ Examples:
                     else:
                         try:
                             shutil.copy2(str(_vr_file), str(_vr_dest))
+                            _ensure_max_dimension(_vr_dest)
                             _vr_copied += 1
                         except Exception as _vr_e:
                             _warn(f"Could not copy vector render "
@@ -7444,6 +8341,87 @@ Examples:
                              f"Could not move agent descriptions: "
                              f"{e}"))
 
+        # ── Issue-A: Move number-diff report and context-summary.json ──
+        # extract-numbers.py writes {stem}-number-diff-report.json and
+        # convert-paper.py writes context-summary.json to the source
+        # directory (alongside the .md before it was moved).  Move them
+        # to target_dir so all outputs are co-located.
+        _source_dir_for_artifacts = args.input_file.parent
+        _artifact_files = [
+            (
+                _source_dir_for_artifacts
+                / f"{input_stem}-number-diff-report.json"
+            ),
+            _source_dir_for_artifacts / "context-summary.json",
+        ]
+        for _art_src in _artifact_files:
+            if not _art_src.exists():
+                continue
+            _art_dst = target_dir / _art_src.name
+            if _art_src.resolve() == _art_dst.resolve():
+                continue
+            if args.dry_run:
+                print(f"  (DRY RUN) Would move {_art_src.name} "
+                      f"→ {target_dir}")
+                _report_place_actions.append(
+                    ("DRY RUN",
+                     f"Would place {_art_src.name} → "
+                     f"{_truncate_path(str(target_dir))}"))
+            else:
+                try:
+                    atomic_move(_art_src, _art_dst)
+                    print(f"  PLACED: {_art_src.name} → {target_dir}")
+                    _report_place_actions.append(
+                        ("PLACED",
+                         f"{_art_src.name} → "
+                         f"{_truncate_path(str(target_dir))}"))
+                except Exception as _art_e:
+                    _warn(f"Could not move {_art_src.name}: {_art_e}")
+                    _report_place_actions.append(
+                        ("WARNING",
+                         f"Could not move {_art_src.name}: {_art_e}"))
+
+        # ── Fix 3.9/m20: Update YAML source_path in MD file ────────────
+        # After all moves are complete, the source_path in the YAML
+        # frontmatter still points to the original location.  Update it
+        # to point to the new location in _originals/.
+        if not args.dry_run and target_md.exists():
+            try:
+                _md_c_39 = target_md.read_text(encoding='utf-8')
+                _yaml_m_39 = re.match(
+                    r'(---\n)(.*?)(---\n)', _md_c_39, re.DOTALL)
+                if _yaml_m_39:
+                    _yb_39 = _yaml_m_39.group(2)
+                    _new_src_39 = str(
+                        target_dir / ORIGINALS_SUBDIR
+                        / args.input_file.name)
+                    _old_sp_match = re.search(
+                        r'^source_path:\s*(.*)$',
+                        _yb_39, re.MULTILINE)
+                    if _old_sp_match:
+                        _old_sp_val = _old_sp_match.group(1).strip().strip('"')
+                        if _old_sp_val != _new_src_39:
+                            # MINOR-5: Use re.escape to avoid backslash
+                            # interpretation in replacement string
+                            _escaped_src_39 = _new_src_39.replace(
+                                '\\', '\\\\')
+                            _yb_39 = re.sub(
+                                r'(source_path:\s*).*',
+                                rf'\1"{_escaped_src_39}"',
+                                _yb_39
+                            )
+                            _md_c_39 = (
+                                _yaml_m_39.group(1) + _yb_39
+                                + _yaml_m_39.group(3)
+                                + _md_c_39[_yaml_m_39.end():])
+                            target_md.write_text(
+                                _md_c_39, encoding='utf-8')
+                            print(f"  REWRITTEN: YAML source_path updated "
+                                  f"to {ORIGINALS_SUBDIR}/")
+            except Exception as _sp_e:
+                _warn(f"Fix 3.9/m20: Could not update YAML "
+                      f"source_path: {_sp_e}")
+
         # ── R4: Cleanup Intermediate Files ─────────────────────────────
         print(f"\n{'─' * 40}")
         print("Step 10: Cleanup Intermediate Files (R4)")
@@ -7682,11 +8660,7 @@ Examples:
     else:
         # No --target-dir: v3.0 behavior. No organization.
         # R7: Still print a visual report (spec says "always printed").
-        # The MOVEMENTS section shows "no target-dir, organization skipped."
-        try:
-            source_hash  # noqa: F841
-        except NameError:
-            source_hash = _compute_sha256(args.input_file)
+        # source_hash already computed early (before any file moves)
 
         _v_passed, _v_warn, _v_err, _v_fm = \
             verify_conversion_output(output_md)

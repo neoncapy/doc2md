@@ -3,7 +3,7 @@
 Post-process pandoc .docx files with professional styling.
 
 Tables:
-- Header: Dark Navy (#022366) background, white bold text
+- Header: Dark Blue (#022366) background, white bold text
 - Alternating rows: white / medium blue-grey (#CBD5E1)
 - Borders: dark grey (#5A5A5A), 1pt on all lines
 - Column widths: content-proportional (sqrt-weighted)

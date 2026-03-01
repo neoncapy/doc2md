@@ -302,6 +302,10 @@ def _count_numeric_values_per_cell(row: str) -> list[int]:
         # cause false-positive multi-value counts when the ** surround numbers.
         # Simple replacement is safe here because we only care about numeric tokens.
         cleaned = re.sub(r'\*{1,2}', '', cleaned)
+        # Fix 3.10B: Replace WxH dimension patterns (e.g., "1920x1080",
+        # "640x480") with a single placeholder. These appear in Image
+        # Index tables and should count as 1 value, not 2 (m8 fix).
+        cleaned = re.sub(r'\d+\s*[xX]\s*\d+', '__DIM__', cleaned)
         # Replace ISO dates with a placeholder (1 value)
         cleaned = date_pattern.sub('__DATE__', cleaned)
         # For ranges: replace the dash between digits with a space
@@ -321,6 +325,8 @@ def _count_numeric_values_per_cell(row: str) -> list[int]:
         nc += cleaned.count('__DATE__')
         # Add back 1 for each range placeholder (ranges are 1 value)
         nc += cleaned.count('__RANGE__')
+        # Add back 1 for each dimension placeholder (dimensions are 1 value)
+        nc += cleaned.count('__DIM__')
         counts.append(nc)
 
     return counts
@@ -370,6 +376,56 @@ def check_table_collapse(content: str) -> tuple[list[str], list[int]]:
     for idx, block in enumerate(table_blocks):
         rows = block['rows']
         table_num = idx + 1
+
+        # ── Fix 1.2: Skip tables under "## Image Index" heading ──────────
+        # Image Index tables contain filenames like image-001.png whose
+        # numeric tokens trigger false-positive numeric density detection.
+        # Scan backward from the table start to find the nearest heading.
+        start_line = block['start']
+        is_image_index_table = False
+        for scan_idx in range(start_line - 1, -1, -1):
+            scan_line = lines[scan_idx].strip()
+            if scan_line.startswith('#'):
+                if 'image index' in scan_line.lower():
+                    is_image_index_table = True
+                break  # stop at the first heading found
+        # Secondary check: if any cell contains a file extension pattern,
+        # it is likely a file listing table, not a data table.
+        if not is_image_index_table:
+            file_ext_pattern = re.compile(
+                r'\.(png|jpg|jpeg|gif|tiff|svg|bmp|webp)',
+                re.IGNORECASE
+            )
+            ext_row_count = sum(
+                1 for r in rows if file_ext_pattern.search(r)
+            )
+            # If majority of rows contain file extensions, skip
+            if len(rows) > 0 and ext_row_count / len(rows) > 0.5:
+                is_image_index_table = True
+        # Fix 3.10B: Header keyword detection (m8) -- catches Image Index
+        # tables even when not under an "Image Index" heading (e.g.,
+        # non-standard heading text or tables embedded in other sections).
+        # Requires 2+ keyword matches to avoid false skips on data tables
+        # that happen to have one matching column name.
+        if not is_image_index_table:
+            _data_rows_for_hdr = [
+                r for r in rows if not _is_separator_row(r)
+            ]
+            _header = _data_rows_for_hdr[0] if _data_rows_for_hdr else ""
+            _index_keywords = [
+                "page", "file", "classification", "dimensions",
+                "figure_num", "filename", "image_path", "fig_",
+                "page_num", "img_",
+            ]
+            _kw_hits = sum(
+                1 for kw in _index_keywords
+                if kw in _header.lower()
+            )
+            if _kw_hits >= 2:
+                is_image_index_table = True
+        if is_image_index_table:
+            continue
+        # ──────────────────────────────────────────────────────────────────
 
         # Collect data rows only (skip separator rows)
         data_rows = [r for r in rows if not _is_separator_row(r)]
@@ -590,11 +646,14 @@ def annotate_collapsed_tables(content: str, flagged_end_lines: list[int]) -> str
         # Insert the comment after the last line of the table,
         # but only if the comment is not already present nearby
         # (idempotency guard — I5 fix: scan past blank lines).
+        # Fix 1.4: Extended to check BOTH forward AND backward for
+        # existing warnings. Forward catches warnings after table;
+        # backward catches warnings before table (e.g., manually
+        # added or from prior QC runs with different table parsing).
         insert_pos = end_idx + 1
         already_annotated = False
-        # Look ahead up to 3 lines past the table end for an
-        # existing WARNING comment (handles blank line gaps).
-        for lookahead in range(3):
+        # Forward scan: look ahead up to 5 lines past the table end
+        for lookahead in range(5):
             check_idx = insert_pos + lookahead
             if check_idx >= len(lines):
                 break
@@ -604,6 +663,21 @@ def annotate_collapsed_tables(content: str, flagged_end_lines: list[int]) -> str
             # Stop scanning if we hit non-blank, non-comment content
             if lines[check_idx].strip() and not lines[check_idx].strip().startswith('<!--'):
                 break
+        # Backward scan: look behind up to 5 lines before the table
+        # start for an existing WARNING comment (catches warnings
+        # placed above the table in prior QC runs).
+        if not already_annotated:
+            table_start = block['start']
+            for lookback in range(1, 6):
+                check_idx = table_start - lookback
+                if check_idx < 0:
+                    break
+                if 'WARNING: Table may have collapsed columns' in lines[check_idx]:
+                    already_annotated = True
+                    break
+                # Stop scanning if we hit non-blank, non-comment content
+                if lines[check_idx].strip() and not lines[check_idx].strip().startswith('<!--'):
+                    break
         if not already_annotated:
             lines.insert(insert_pos, comment)
 
@@ -614,13 +688,74 @@ def check_references(content: str) -> list[str]:
     """Check that reference numbers [1]-[N] are sequential."""
     issues = []
 
-    # Find all bracketed numbers like [1], [2], etc.
-    refs = re.findall(r'\[(\d+)\]', content)
+    # ── Fix 1.1: Use \d{1,4} to exclude DOI fragments (e.g. [0962280211419645])
+    # that caused MemoryError when range() tried to allocate trillions of elements.
+    # Academic papers never have >9999 references, so 1-4 digits is sufficient.
+
+    # Find all bracketed single numbers like [1], [2], etc. (1-4 digits only)
+    refs = re.findall(r'\[(\d{1,4})\]', content)
+
+    # ── Fix 1.3: Parse range citations like [6-8] or [6–8] and group
+    # citations like [6,9,10] that the single-number regex misses.
+
+    # Range refs: [6-8] or [6–8] (en-dash variant)
+    range_refs = re.findall(r'\[(\d{1,4})\s*[-–]\s*(\d{1,4})\]', content)
+    for start_s, end_s in range_refs:
+        start_n, end_n = int(start_s), int(end_s)
+        # Sanity cap: max 50 elements per range to prevent edge cases
+        if 0 < end_n - start_n <= 50:
+            refs.extend(str(n) for n in range(start_n, end_n + 1))
+
+    # Group refs: [6,9,10] or [6, 9, 10]
+    # Fix 3.10A: Strip DOI patterns before group ref extraction to prevent
+    # DOI fragments like [0962280211419645] from being split on commas
+    # and parsed as reference numbers (M20 prevention).
+    # Broader pattern catches both bare DOIs (10.xxxx/...) and prefixed
+    # DOIs (doi: 10.xxxx/..., DOI: 10.xxxx/...).
+    _content_no_doi = re.sub(
+        r'(?:doi|DOI)[:\s]*10\.\d{4,}/\S+', '', content
+    )
+    _content_no_doi = re.sub(r'10\.\d{4,}/[^\s\]]+', '', _content_no_doi)
+    group_refs = re.findall(r'\[([\d,\s]+)\]', _content_no_doi)
+    for group in group_refs:
+        nums = re.findall(r'\d+', group)
+        if len(nums) > 1:  # only if actually a group (2+ numbers)
+            # Filter to 1-4 digit numbers only (consistent with Fix 1.1)
+            group_nums = [int(n) for n in nums if len(n) <= 4]
+            # Fix 1.3a: Guard against false positives from comma-formatted
+            # numbers (e.g. [1,000] → 1, 0) and year lists ([2020, 2021]).
+            # Guard 1: all refs must be >= 1 (no ref numbered 0)
+            # Guard 2: all refs must be <= 500 (no paper has 500+ refs)
+            # Guard 3: group must have >= 2 valid numbers
+            if len(group_nums) < 2:
+                continue
+            if any(n < 1 or n > 500 for n in group_nums):
+                continue
+            refs.extend(str(n) for n in group_nums)
+
     if not refs:
         issues.append("INFO: No bracketed references [N] found")
         return issues
 
     ref_nums = sorted(set(int(r) for r in refs))
+
+    # ── Fix Issue C: Filter out year-like numbers (1900-2099) that appear
+    # as bracketed years in academic text, e.g. [2017], [2024].
+    # No academic paper has 1900+ numbered references, so this is safe.
+    # Must happen BEFORE gap analysis to prevent ~2000 false gap warnings.
+    ref_nums = [n for n in ref_nums if not (1900 <= n <= 2099)]
+
+    # ── Fix 1.1 (secondary guard): Filter out any numbers exceeding 9999.
+    # Belt-and-suspenders: the \d{1,4} regex should prevent this, but
+    # group parsing could theoretically let through longer numbers.
+    MAX_REF_NUMBER = 9999
+    ref_nums = [n for n in ref_nums if n <= MAX_REF_NUMBER]
+    if not ref_nums:
+        issues.append(
+            "INFO: No valid reference numbers found "
+            "(all exceeded max threshold of 9999)"
+        )
+        return issues
 
     # Check sequential from 1
     if ref_nums[0] != 1:
@@ -1054,6 +1189,28 @@ def _record_conversion_issues(
     if conv_issues_path is None:
         return
 
+    # Fix 3.10C: Deduplication guard (m11). Before appending, read the
+    # existing file and check whether each issue is already recorded.
+    # Signature = issue_type prefix + first 50 chars of the issue text.
+    # This prevents duplicate entries when QC is run multiple times on
+    # the same file (e.g., during fix-and-rerun cycles).
+    existing_content = ""
+    if conv_issues_path.exists():
+        try:
+            existing_content = conv_issues_path.read_text(encoding='utf-8')
+        except OSError:
+            pass  # if we can't read, proceed without dedup
+
+    # Filter out issues already present in the file
+    new_issues = []
+    for issue in warn_issues:
+        sig = f"{issue[:50]}"
+        if sig not in existing_content:
+            new_issues.append(issue)
+
+    if not new_issues:
+        return  # all issues already recorded; skip duplicate append
+
     from datetime import datetime
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
 
@@ -1061,7 +1218,7 @@ def _record_conversion_issues(
         f"\n## Table Collapse Warning — {md_path.name} ({timestamp})\n",
         f"Source: `{md_path}`\n",
     ]
-    for issue in warn_issues:
+    for issue in new_issues:
         entry_lines.append(f"- {issue}\n")
 
     try:

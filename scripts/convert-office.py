@@ -59,6 +59,31 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _ensure_max_dimension(img_path, max_dim=2000):
+    """Resize image in-place if either dimension exceeds max_dim.
+
+    Uses PIL thumbnail() which preserves aspect ratio and uses LANCZOS
+    resampling for quality.  Images already within limits are untouched.
+
+    Returns True if image was resized, False otherwise.
+    """
+    try:
+        from PIL import Image as _PilResize
+        with _PilResize.open(img_path) as _img:
+            if max(_img.size) <= max_dim:
+                return False
+            _orig = _img.size
+            _img.thumbnail((max_dim, max_dim), _PilResize.LANCZOS)
+            _img.save(img_path)
+            log.info(f"  [resize] {Path(img_path).name}: "
+                     f"{_orig[0]}x{_orig[1]} -> "
+                     f"{_img.size[0]}x{_img.size[1]}")
+            return True
+    except Exception as _e:
+        log.warning(f"Could not resize {Path(img_path).name}: {_e}")
+        return False
+
+
 # RC7: PUA (Private Use Area) → Unicode mapping for Symbol/Wingdings fonts.
 # PowerPoint embeds Greek letters and math symbols as PUA codepoints when
 # the source font is Symbol or Wingdings.  python-pptx extracts the raw
@@ -149,6 +174,21 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _sanitize_comment_text(text: str) -> str:
+    """Collapse newlines/whitespace to single space for use inside HTML comments.
+
+    Fix 3.11: Prevents IMAGE NOTEs from being trapped inside multi-line
+    HTML comment blocks.  When slide titles or context strings contain
+    newlines, <!-- IMAGE: ... --> comments span multiple lines, causing
+    merge-image-notes.py to insert notes INSIDE the comment block.
+    """
+    if not text:
+        return ""
+    text = text.replace("\n", " ").replace("\r", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def ext_from_content_type(content_type: str) -> str:
     """Map content_type to file extension."""
     mapping = {
@@ -173,6 +213,7 @@ def convert_wmf_to_png(wmf_path: Path, output_dir: Path) -> Path | None:
         from PIL import Image
         img = Image.open(wmf_path)
         img.save(png_path)
+        _ensure_max_dimension(png_path)
         log.info(f"  PIL converted {wmf_path.name} -> {png_path.name}")
         return png_path
     except Exception:
@@ -192,6 +233,7 @@ def convert_wmf_to_png(wmf_path: Path, output_dir: Path) -> Path | None:
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0 and png_path.exists():
+            _ensure_max_dimension(png_path)
             log.info(f"  soffice converted {wmf_path.name} -> {png_path.name}")
             return png_path
         else:
@@ -433,6 +475,13 @@ def _is_decorative_image(page_num: int, total_pages: int,
     # Heuristic 1: Small images (< 50x50) are decorative (icons, bullets, tiny logos)
     if width > 0 and height > 0 and width < 50 and height < 50:
         return True
+
+    # Fix 3.6/M4: Full-slide section dividers in PPTX
+    # Very large images (>= 7000x4000) with minimal text (< 15 words)
+    # are typically PPTX section divider backgrounds, not substantive content.
+    if width >= 7000 and height >= 4000:
+        if len(context.split()) < 15:
+            return True
 
     # Heuristic 4: Repeated image on >50% of pages -> watermark/header/logo
     if is_repeated:
@@ -1458,6 +1507,9 @@ def convert_pptx(input_path: Path, output_dir: Path, skip_vision: bool) -> dict:
                         except Exception as e:
                             log.warning(f"  TIFF→PNG conversion failed for {final_path.name}: {e}")
 
+                    # Fix 1.8: resize oversized images before analysis
+                    _ensure_max_dimension(final_path)
+
                     size_bytes = final_path.stat().st_size
                     decorative = size_bytes < 5000
                     dims = get_image_dimensions(final_path)
@@ -1643,10 +1695,16 @@ def convert_pptx(input_path: Path, output_dir: Path, skip_vision: bool) -> dict:
                 img_rel_path = f"{basename}_images/{fname}"
                 dims = img_info.get("dims", [0, 0])
                 dec = " | Decorative: yes" if img_info.get("decorative") else ""
+                # Fix 3.6/M18: Propagate duplicate flag to IMAGE comment
+                dup = " | Duplicate: yes" if img_info.get("is_duplicate") else ""
+                if img_info.get("is_duplicate") and not dec:
+                    dec = " | Decorative: yes"
+                # Fix 3.11: sanitize context to prevent multi-line comments
+                _ctx = _sanitize_comment_text(slide_title)
                 md_lines.append(
                     f"<!-- IMAGE: {img_rel_path} | "
-                    f"Size: {dims[0]}x{dims[1]}{dec} | "
-                    f"Context: {slide_title} -->"
+                    f"Size: {dims[0]}x{dims[1]}{dec}{dup} | "
+                    f"Context: {_ctx} -->"
                 )
                 md_lines.append(f"![Image {img_info['id']}]({img_rel_path})")
             md_lines.append("")
@@ -1839,6 +1897,7 @@ def convert_pptx(input_path: Path, output_dir: Path, skip_vision: bool) -> dict:
                             render_filename = f"{render_id}.png"
                             dest_path = images_dir / render_filename
                             shutil.copy2(src_png, dest_path)
+                            _ensure_max_dimension(dest_path)
 
                             # Get dimensions
                             dims = get_image_dimensions(dest_path)
@@ -1976,6 +2035,9 @@ def convert_pptx(input_path: Path, output_dir: Path, skip_vision: bool) -> dict:
                                             if first_replacement:
                                                 # Issue 6 fix: use subdirectory-relative path
                                                 render_rel_path = f"{basename}_images/{render_filename}"
+                                                # Fix 3.11: sanitize context
+                                                _ctx2 = _sanitize_comment_text(
+                                                    slide_title_ctx)
                                                 md_lines[i] = (
                                                     f"<!-- IMAGE: "
                                                     f"{render_rel_path}"
@@ -1985,7 +2047,7 @@ def convert_pptx(input_path: Path, output_dir: Path, skip_vision: bool) -> dict:
                                                     f"Source: soffice "
                                                     f"slide render | "
                                                     f"Context: "
-                                                    f"{slide_title_ctx}"
+                                                    f"{_ctx2}"
                                                     f" -->\n"
                                                     f"![Figure "
                                                     f"{render_id}: "
@@ -2070,6 +2132,7 @@ slides: {total_slides}
 total_images: {len([i for i in manifest_images if i.get('file')])}
 images_directory: "{basename}_images/"
 pipeline_version: "{PIPELINE_VERSION}"
+image_notes: {"pending" if len([i for i in manifest_images if i.get('file')]) > 0 else "none"}
 ---
 """
 
@@ -2589,6 +2652,9 @@ def convert_docx(input_path: Path, output_dir: Path, skip_vision: bool) -> dict:
                         except Exception as e:
                             log.warning(f"  TIFF→PNG conversion failed for {final_path.name}: {e}")
 
+                    # Fix 1.8: resize oversized images before analysis
+                    _ensure_max_dimension(final_path)
+
                     size_bytes = final_path.stat().st_size
                     decorative = size_bytes < 5000
                     dims = get_image_dimensions(final_path)
@@ -2847,6 +2913,7 @@ fidelity_standard: "text_content"
 total_images: {total_images_with_files}
 images_directory: "{basename}_images/"
 pipeline_version: "{PIPELINE_VERSION}"
+image_notes: {"pending" if total_images_with_files > 0 else "none"}
 ---
 """
 
@@ -2858,11 +2925,16 @@ pipeline_version: "{PIPELINE_VERSION}"
             if img.get("file"):
                 # Issue 6 fix: use subdirectory-relative path instead of bare filename
                 img_rel_path = f"{basename}_images/{img['file']}"
-                dec = " (decorative)" if img.get("decorative") else ""
+                # MINOR-2: Standardized to PPTX format for consistency
+                dec = " | Decorative: yes" if img.get("decorative") else ""
+                # Fix 3.6/M18: Propagate duplicate flag to IMAGE comment
+                dup = " | Duplicate: yes" if img.get("is_duplicate") else ""
+                if img.get("is_duplicate") and not dec:
+                    dec = " | Decorative: yes"
                 image_section += (
                     f"<!-- IMAGE: {img_rel_path} | "
                     f"Size: {img['dimensions'][0]}x{img['dimensions'][1]}"
-                    f"{dec} -->\n"
+                    f"{dec}{dup} -->\n"
                     f"![Image {img['id']}]({img_rel_path})\n\n"
                 )
 
@@ -2988,6 +3060,7 @@ document_type: "text"
 fidelity_standard: "text_content"
 total_images: 0
 pipeline_version: "{PIPELINE_VERSION}"
+image_notes: none
 ---
 """
 

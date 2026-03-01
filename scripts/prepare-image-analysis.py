@@ -32,7 +32,28 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+def get_image_dimensions(image_path: str) -> Tuple[Optional[int], Optional[int]]:
+    """Read image dimensions using PIL header read (fast, no full decode).
+
+    Returns (width, height) as integers, or (None, None) on any failure.
+    Requires Pillow. Gracefully degrades if PIL is unavailable or file is corrupt.
+    """
+    if not _PIL_AVAILABLE:
+        return (None, None)
+    try:
+        with PILImage.open(image_path) as img:
+            return img.size  # (width, height)
+    except Exception:
+        return (None, None)
+
 
 # The full persona activation matrix from discovery-personas-design.md
 ACTIVATION_MATRIX = {
@@ -500,12 +521,28 @@ def generate_analysis_manifest(md_path: Path, manifest: dict, context_summary: O
         # Compute correct relative path (works for both PDF and office formats)
         file_path_rel = _relative_file_path(img, manifest, md_path)
 
+        # Read actual pixel dimensions from image file using PIL.
+        # Prefer absolute file_path from manifest entry; fall back to
+        # images_dir + filename. If neither resolves, dimensions are None.
+        _abs_path = img.get("file_path") or (
+            str(Path(manifest.get("images_dir", "")) / img.get("filename", ""))
+            if manifest.get("images_dir") and img.get("filename")
+            else None
+        )
+        pil_width, pil_height = get_image_dimensions(_abs_path) if _abs_path else (None, None)
+        _max_dim = max(pil_width, pil_height) if (pil_width is not None and pil_height is not None) else None
+        _oversized = (_max_dim is not None and _max_dim > 2000)
+
         analysis_images.append({
             "figure_num": img["figure_num"],
             "filename": img["filename"],
             "file_path": file_path_rel,
             "page": img.get("page"),
-            "dimensions": {"width": img["width"], "height": img["height"]},
+            "dimensions": {"width": img.get("width", 0), "height": img.get("height", 0)},
+            "width": pil_width,
+            "height": pil_height,
+            "max_dimension": _max_dim,
+            "oversized_warning": _oversized,
             "detected_caption": img.get("detected_caption"),
             "type_guess": img.get("type_guess"),
             "section_context": img.get("section_context"),
@@ -520,6 +557,30 @@ def generate_analysis_manifest(md_path: Path, manifest: dict, context_summary: O
             f"{skipped_blanks} blank image(s), and "
             f"{skipped_decoratives} decorative image(s) from vision analysis"
         )
+
+    # Compute dimension summary across all analysis images
+    _all_max_dims = [
+        img["max_dimension"]
+        for img in analysis_images
+        if img.get("max_dimension") is not None
+    ]
+    _oversized_entries = [
+        img for img in analysis_images
+        if img.get("oversized_warning")
+    ]
+    _global_max_dim = max(_all_max_dims) if _all_max_dims else None
+    _images_over_2000 = len(_oversized_entries)
+    _oversized_paths = [img["file_path"] for img in _oversized_entries]
+
+    # Console warning for oversized images
+    if _images_over_2000 > 0:
+        print(f"\n\u26a0 WARNING: {_images_over_2000} image(s) exceed 2000px dimension limit!")
+        print(f"  Max dimension found: {_global_max_dim}px")
+        print(f"  These images may crash Opus vision agents.")
+        print(f"  Consider resizing before Step 4.")
+        for path in _oversized_paths:
+            print(f"    - {path}")
+        print()
 
     # Compute persona frequency
     persona_counts = {}
@@ -559,6 +620,19 @@ def generate_analysis_manifest(md_path: Path, manifest: dict, context_summary: O
         else:
             document_domain = ctx_domain or "general"
 
+    # Dimension summary — additive (preserves any pre-existing summary fields
+    # that a future caller might inject before writing to disk)
+    _substantive_count = len(analysis_images)
+    _decorative_count = skipped_decoratives
+    dimension_summary = {
+        "total_images": _substantive_count,
+        "substantive_images": _substantive_count,
+        "decorative_images": _decorative_count,
+        "max_dimension": _global_max_dim,
+        "images_over_2000px": _images_over_2000,
+        "oversized_image_paths": _oversized_paths,
+    }
+
     return {
         "md_file": str(md_path),
         "images_dir": str(manifest["images_dir"]),
@@ -571,6 +645,7 @@ def generate_analysis_manifest(md_path: Path, manifest: dict, context_summary: O
         "skipped_decoratives": skipped_decoratives,
         "analysis_date": datetime.now().isoformat(),
         "images": analysis_images,
+        "summary": dimension_summary,
         "persona_definitions": PERSONA_DEFINITIONS,
         "activation_summary": {
             "total_persona_analyses": total_persona_analyses,
@@ -579,6 +654,46 @@ def generate_analysis_manifest(md_path: Path, manifest: dict, context_summary: O
             "persona_frequencies": persona_counts,
         }
     }
+
+
+def verify_coverage(manifest, notes_dir):
+    """Check all SUB images have IMAGE NOTE files before merge.
+
+    Pre-merge verification that prevents silent content gaps where
+    substantive images are missing descriptions.
+
+    Addresses:
+      M5  - Batch scope incomplete
+      M11 - fitz fallback images outside scope
+
+    Args:
+        manifest: Parsed image-manifest.json dict.
+        notes_dir: Path (str or Path) to directory containing IMAGE NOTE .md files.
+
+    Returns:
+        Tuple of (bool, list): (all_covered, sorted list of missing filenames).
+        True means every substantive image has a corresponding note file.
+    """
+    sub_images = set()
+    for img in manifest.get("images", []):
+        if img.get("is_substantive", True) and not img.get("is_blank", False) and not img.get("is_duplicate", False):
+            sub_images.add(img["filename"])
+
+    covered = set()
+    notes_path = Path(notes_dir) if notes_dir else None
+    if notes_path and notes_path.exists():
+        for note_file in notes_path.glob("*.md"):
+            content = note_file.read_text(encoding='utf-8')
+            refs = re.findall(r'file:\s*\S*?([^/\s]+\.(?:png|jpg))',
+                              content)
+            covered.update(refs)
+
+    missing = sub_images - covered
+    if missing:
+        print(f"  MISSING COVERAGE: {len(missing)} SUB image(s)")
+        for m in sorted(missing):
+            print(f"    - {m}")
+    return len(missing) == 0, sorted(missing)
 
 
 def main():
@@ -594,12 +709,35 @@ def main():
         "--context-summary", type=Path, default=None,
         help="Path to context-summary.json (auto-detected if omitted)"
     )
+    parser.add_argument(
+        "--verify-coverage", action="store_true",
+        help="Verify all substantive images have descriptions before merge"
+    )
+    parser.add_argument(
+        "--notes-dir", type=Path, default=None,
+        help="Path to directory containing IMAGE NOTE .md files (used with --verify-coverage)"
+    )
 
     args = parser.parse_args()
 
     if not args.md_file.exists():
         print(f"ERROR: File not found: {args.md_file}")
         sys.exit(1)
+
+    # --verify-coverage mode: check image coverage and exit
+    if args.verify_coverage:
+        manifest = load_manifest(args.md_file, explicit_manifest=args.manifest)
+        notes_dir = args.notes_dir
+        if notes_dir is None:
+            # Default: images directory (same location as manifest)
+            notes_dir = Path(manifest.get("images_dir", args.md_file.parent / "images"))
+        all_covered, missing = verify_coverage(manifest, notes_dir)
+        if all_covered:
+            print(f"PASS: All substantive images have coverage in {notes_dir}")
+            sys.exit(0)
+        else:
+            print(f"FAIL: {len(missing)} substantive image(s) missing coverage")
+            sys.exit(1)
 
     print(f"Preparing image analysis for: {args.md_file}")
 

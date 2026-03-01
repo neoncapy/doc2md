@@ -44,7 +44,8 @@ with full access to every word, table, heading, and figure from the source docum
 | Feature | Description |
 |---|---|
 | **Unified router** | Single entry point handles PDF, DOCX, PPTX, and TXT |
-| **Multi-extractor PDF** | pymupdf4llm (default), pdfplumber (cross-validation), MinerU (complex layouts) |
+| **Multi-extractor PDF** | marker (default for digital), docling (default for scanned), pymupdf4llm (fallback), MinerU (complex layouts) |
+| **Quality gate fallback** | Automatic extractor fallback when output quality is below threshold |
 | **Office conversion** | DOCX via pandoc + python-docx; PPTX via python-pptx with recursive group shape extraction |
 | **Chart rendering** | LibreOffice &rarr; PDF &rarr; pdftoppm at 300 DPI for SmartArt and embedded charts |
 | **Image deduplication** | SHA-256 hashing skips duplicate images across pages |
@@ -53,10 +54,11 @@ with full access to every word, table, heading, and figure from the source docum
 | **Vector content detection** | pymupdf `get_drawings()` identifies diagrams, SmartArt, shape-based figures |
 | **Structural QC engine** | Automated checks for table collapse, heading hierarchy, YAML metadata, encoding errors |
 | **Persona activation matrix** | Maps 24+ image types to 8 expert personas for targeted LLM analysis |
-| **Conversion registry** | JSON registry with SHA-256 hashes, image metadata, conversion timestamps |
+| **Conversion registry** | JSON registry with SHA-256 hashes, fcntl locking for concurrent pipelines |
 | **Image indexing** | Per-file and project-level testable image indexes |
 | **Claude Code hook** | Enforces "never read raw PDF" policy at the tool level |
 | **MinerU fallback** | Auto-switches to MinerU when cross-validation failure rate exceeds 40% |
+| **Page-count timeout** | Extraction timeouts scale with document page count |
 | **DOCX table styling** | Professional styling for pandoc-generated Word documents |
 
 ---
@@ -82,7 +84,7 @@ with full access to every word, table, heading, and figure from the source docum
                    ▼                   ▼                    ▼
           ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
           │ convert-paper  │  │ convert-office  │  │ convert-office  │
-          │  pymupdf4llm   │  │  pandoc+docx    │  │  python-pptx   │
+          │  marker/docling │  │  pandoc+docx    │  │  python-pptx   │
           └────────┬───────┘  └────────┬───────┘  └────────┬───────┘
                    │                   │                    │
                    └───────────┬───────┘────────────────────┘
@@ -91,6 +93,7 @@ with full access to every word, table, heading, and figure from the source docum
                    │  Step 1b: Cross-Val   │  (PDF only: pdfplumber)
                    │  Step 2:  Structural  │  (QC gate — must PASS)
                    │  Step 3:  Image Prep  │  (persona activation)
+                   │  Step 3b: Re-run Prep │  (after Step 6c manifest)
                    │  Step 6c: Image Index │  (SUB/DEC classification)
                    └───────────┬───────────┘
                                │
@@ -122,11 +125,14 @@ Claude Code's agent system or the included skill definition.
 
 ```bash
 # Core dependencies
-pip install pymupdf pymupdf4llm pdfplumber python-docx python-pptx Pillow numpy
+pip install marker-pdf pymupdf pymupdf4llm pdfplumber python-docx python-pptx Pillow numpy
 
 # Pandoc (required for DOCX text extraction)
 brew install pandoc        # macOS
 sudo apt install pandoc    # Ubuntu/Debian
+
+# Optional: Docling (default for scanned PDFs)
+pip install docling symspellpy wordsegment
 
 # Optional: LibreOffice (for chart/SmartArt rendering in PPTX)
 brew install --cask libreoffice    # macOS
@@ -180,7 +186,7 @@ python3 run-pipeline.py <input-file> [options]
 | `-i`, `--images` | Image output directory |
 | `-s`, `--short-name` | Short name for file references |
 | `--target-dir` | Organized output directory (moves source to `_originals/`) |
-| `--force-extractor` | Override extractor selection (pymupdf4llm, tesseract, mineru) |
+| `--force-extractor` | Override extractor selection (marker, docling, pymupdf4llm, mineru, tesseract) |
 | `--skip-xval` | Skip cross-validation step |
 | `--dry-run` | Test without moving files |
 | `--generate-testable-index` | Generate project-level image index |
@@ -188,8 +194,12 @@ python3 run-pipeline.py <input-file> [options]
 ### PDF Conversion
 
 ```bash
-# Standard (pymupdf4llm + pdfplumber cross-validation)
+# Standard (marker + pdfplumber cross-validation)
 python3 run-pipeline.py paper.pdf -o paper.md -i paper_images/
+
+# Force a specific extractor
+python3 run-pipeline.py paper.pdf --force-extractor docling -o output.md
+python3 run-pipeline.py paper.pdf --force-extractor pymupdf4llm -o output.md
 
 # Force MinerU for complex layouts
 python3 run-pipeline.py scanned-doc.pdf --force-extractor mineru -o output.md
@@ -202,9 +212,10 @@ python3 run-pipeline.py simple.pdf -o simple.md --skip-xval
 
 | Document Type | Default Extractor | Fallback Chain |
 |---|---|---|
-| Digital PDF (>50 chars/page avg) | pymupdf4llm | markitdown &rarr; calibre |
-| Scanned PDF (<50 chars/page avg) | tesseract | mineru &rarr; zerox |
+| Digital PDF (>50 chars/page avg) | marker | docling &rarr; pymupdf4llm &rarr; mineru &rarr; tesseract |
+| Scanned PDF (<50 chars/page avg) | docling | pymupdf4llm &rarr; mineru &rarr; tesseract |
 | Complex PDF (>40% cross-val failures) | Auto-switches to MinerU | — |
+| Quality gate failure | Automatic fallback to next extractor in chain | — |
 
 ### DOCX Conversion
 
@@ -261,18 +272,19 @@ The full pipeline runs these steps in sequence:
 | Step | Name | Tool | Description |
 |---|---|---|---|
 | **0** | Extractor Router | Python | Detect format, measure text density, select extractor |
-| **1** | Text + Image Extraction | Python | Run selected extractor (pymupdf4llm, convert-office, etc.) |
+| **1** | Text + Image Extraction | Python | Run selected extractor (marker, docling, pymupdf4llm, etc.) |
 | **1b** | Cross-Validation | Python | Compare extraction against pdfplumber (PDF only) |
 | **1c** | Early Image Index | Python | Pre-QC image index for MinerU output |
 | **2** | Structural QC | Python | **GATE** — must PASS before proceeding |
 | **3** | Image Analysis Prep | Python | Persona activation matrix, analysis manifest |
+| **3b** | Re-run Image Prep | Python | Re-run prepare-image-analysis after Step 6c creates manifest (for extractors that defer image extraction) |
 | **4** | IMAGE NOTEs | Claude | Multi-expert image descriptions (8 personas) |
 | **5** | Content Fidelity QC | Claude | Verify no text was lost in conversion |
 | **6a** | Number Extraction | Python | Extract numerical data (PDF only) |
 | **6c** | Image Index | Python | Per-image SUB/DEC classification with 8 heuristics |
 | **7-13** | File Organization | Python | Move, rename, registry update, visual report |
 
-Steps 0-3 and 6 run automatically. Steps 4-5 require Claude Code (Tier 2).
+Steps 0-3b and 6 run automatically. Steps 4-5 require Claude Code (Tier 2).
 
 ---
 
@@ -416,8 +428,8 @@ Each entry records:
   "sha256": "a1b2c3...",
   "source_file": "/path/to/original.pdf",
   "output_md": "/path/to/converted.md",
-  "pipeline_version": "3.2.0",
-  "extractor": "pymupdf4llm",
+  "pipeline_version": "3.5.0",
+  "extractor": "marker",
   "conversion_date": "2025-01-15T10:30:00Z",
   "pages": 47,
   "image_index_path": "/path/to/image-index.md",
@@ -457,8 +469,8 @@ Every converted Markdown file includes a YAML frontmatter header:
 source_file: paper.pdf
 source_format: pdf
 conversion_date: "2025-01-15T10:30:00Z"
-conversion_tool: pymupdf4llm
-pipeline_version: "3.2.0"
+conversion_tool: marker
+pipeline_version: "3.5.0"
 fidelity_standard: zero_missing_text
 document_type: academic_paper
 pages: 47
@@ -472,17 +484,18 @@ domain: health_economics
 
 | File | Lines | Description |
 |---|---|---|
-| `scripts/run-pipeline.py` | 7,749 | Unified pipeline router, image classification, file organization, registry management |
-| `scripts/convert-paper.py` | 1,329 | PDF text/image extraction via pymupdf4llm, multi-panel splitting, sparse page rendering |
-| `scripts/convert-office.py` | 3,122 | DOCX/PPTX conversion, recursive shape extraction, chart rendering, PUA Unicode mapping |
-| `scripts/qc-structural.py` | 1,211 | Structural QC engine: YAML validation, table collapse detection, encoding checks |
-| `scripts/prepare-image-analysis.py` | 634 | Persona activation matrix, analysis manifest generation, template skeletons |
+| `scripts/run-pipeline.py` | 8,722 | Unified pipeline router, image classification, file organization, registry management, fcntl locking |
+| `scripts/convert-paper.py` | 4,400 | PDF text/image extraction, docling postprocessing, font encoding, run-together fixes |
+| `scripts/convert-paper-marker.py` | 630 | Marker extractor wrapper with page-count-based timeout and quality validation |
+| `scripts/convert-office.py` | 3,195 | DOCX/PPTX conversion, recursive shape extraction, chart rendering, PUA Unicode mapping |
+| `scripts/qc-structural.py` | 1,368 | Structural QC engine: YAML validation, table collapse detection, encoding checks |
+| `scripts/prepare-image-analysis.py` | 772 | Persona activation matrix, analysis manifest generation, template skeletons |
 | `scripts/convert-mineru.py` | 228 | MinerU fallback wrapper for complex/scanned PDFs (CPU-only) |
 | `scripts/style-docx-tables.py` | 262 | Professional DOCX styling for pandoc output (table colors, borders, code blocks) |
 | `hooks/enforce-pdf-conversion.sh` | 276 | Claude Code PreToolUse hook: intercepts PDF/Office reads, redirects to Markdown |
-| `skill/SKILL.md` | 1,354 | Claude Code skill definition: full pipeline orchestration with QC loops |
+| `claude-code/SKILL.md` | — | Claude Code skill definition: full pipeline orchestration with QC loops |
 
-**Total: ~16,165 lines**
+**Total: ~19,853 lines of Python**
 
 ---
 
@@ -492,8 +505,9 @@ domain: health_economics
 
 | Package | Purpose |
 |---|---|
+| [Marker](https://github.com/VikParuchuri/marker) | Default PDF-to-Markdown extractor for digital PDFs |
 | [PyMuPDF](https://pymupdf.readthedocs.io/) (`fitz`) | PDF parsing, image extraction, vector detection |
-| [pymupdf4llm](https://github.com/pymupdf/pymupdf4llm) | LLM-optimized Markdown extraction from PDF |
+| [pymupdf4llm](https://github.com/pymupdf/pymupdf4llm) | Fallback Markdown extraction from PDF |
 | [pdfplumber](https://github.com/jsvine/pdfplumber) | Cross-validation of PDF extraction |
 | [python-docx](https://python-docx.readthedocs.io/) | DOCX image extraction and styling |
 | [python-pptx](https://python-pptx.readthedocs.io/) | PPTX text and image extraction |
@@ -506,6 +520,9 @@ domain: health_economics
 
 | Package | Purpose |
 |---|---|
+| [Docling](https://github.com/DS4SD/docling) | Default extractor for scanned PDFs, fallback for digital |
+| [symspellpy](https://github.com/mammothb/symspellpy) | Word validation for docling postprocessing |
+| [wordsegment](https://github.com/grantjenks/python-wordsegment) | Run-together word splitting for docling output |
 | [LibreOffice](https://www.libreoffice.org/) | Chart/SmartArt rendering (PPTX) |
 | [MinerU](https://github.com/opendatalab/MinerU) | Complex/scanned PDF fallback extractor |
 | [Tesseract](https://github.com/tesseract-ocr/tesseract) | OCR for scanned documents |
@@ -607,8 +624,9 @@ python3 scripts/run-pipeline.py paper.pdf \
 **Why not just use `markitdown`?**
 MarkItDown is excellent for simple documents but loses table structure,
 heading hierarchy, and images in complex PDFs. This pipeline uses
-pymupdf4llm for superior table and multi-column support, with pdfplumber
-cross-validation to catch extraction errors.
+marker as the default extractor for digital PDFs, with automatic
+fallback through docling, pymupdf4llm, MinerU, and tesseract.
+Cross-validation against pdfplumber catches extraction errors.
 
 **Why a 2-tier architecture?**
 LLM tokens are expensive. The Python tier handles everything that can be

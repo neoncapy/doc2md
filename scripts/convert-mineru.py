@@ -7,8 +7,8 @@ Calls MinerU from its dedicated venv (~/envs/mineru/) to convert
 scanned or complex PDFs to Markdown. Used as a fallback extractor
 when Tesseract OCR is insufficient.
 
-SAFETY: CPU-only mode enforced. MPS/GPU causes kernel panics
-on some Apple Silicon systems.
+SAFETY: CPU-only mode enforced. NEVER use MPS/GPU on M4 Pro Mac
+(causes kernel panics - see ~/.claude/projects MEMORY.md).
 
 Usage:
     python3 convert-mineru.py <input.pdf> --output <output.md>
